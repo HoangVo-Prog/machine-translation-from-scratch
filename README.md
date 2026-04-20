@@ -121,7 +121,7 @@ source .venv/bin/activate
 pip install uv
 uv pip install -r requirements.txt
 ```
---
+---
 
 ## Best Practices
 
