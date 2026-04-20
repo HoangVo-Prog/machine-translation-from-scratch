@@ -1,0 +1,16 @@
+numpy
+pandas
+matplotlib
+scikit-learn
+tqdm
+PyYAML
+torch
+torchvision
+torchaudio
+evaluate
+sacrebleu
+jupyter
+notebook
+pytest
+black
+isort
