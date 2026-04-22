@@ -25,7 +25,7 @@ VI_COMPOUND_WORDS = load_vi_words()
 def tokenize_vi(text):
     # Tách từ tiếng Việt sử dụng thuật toán Longest Matching
     cleaned = clean_text_vi(text)
-    
+
     # Tách âm tiết thủ công (không dùng .split)
     syllables = []
     word = ""
