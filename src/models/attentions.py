@@ -2,6 +2,7 @@ import math
 
 import torch
 import torch.nn as nn
+from src.models.activations import softmax
 
 
 class ManualLinear(nn.Module):
@@ -45,7 +46,7 @@ class BahdanauAttention(nn.Module):
         if mask is not None:
             scores = scores.masked_fill(mask, torch.finfo(scores.dtype).min)
 
-        attention_weights = torch.softmax(scores, dim=-1)
+        attention_weights = softmax(scores)
         context = torch.bmm(attention_weights.unsqueeze(1), encoder_outputs).squeeze(1)
         return context, attention_weights
 
@@ -96,6 +97,9 @@ class LuongAttention(nn.Module):
         if mask is not None:
             scores = scores.masked_fill(mask, torch.finfo(scores.dtype).min)
 
-        attention_weights = torch.softmax(scores, dim=-1)
+        attention_weights = softmax(scores)
         context = torch.bmm(attention_weights.unsqueeze(1), encoder_outputs).squeeze(1)
         return context, attention_weights
+
+
+__all__ = ["ManualLinear", "BahdanauAttention", "LuongAttention"]
