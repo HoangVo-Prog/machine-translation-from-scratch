@@ -14,3 +14,6 @@ notebook
 pytest
 black
 isort
+sacrebleu
+rouge-score
+python-dotenv

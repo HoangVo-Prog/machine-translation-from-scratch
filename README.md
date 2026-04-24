@@ -131,3 +131,49 @@ uv pip install -r requirements.txt
 - separate reusable library code in `src/` from runnable scripts in `scripts/`
 - use `tests/` for quick validation of dataset logic, tokenization, and model shapes
 
+---
+
+## Training Command (CLI)
+
+The training logic lives in `src/training/` (`trainer.py`, `optimizer.py`, `losses.py`, `evaluate.py`).
+CLI implementation lives in `src/cli/train.py`.
+`scripts/train.py` is only a launcher wrapper.
+
+```bash
+python -m src.cli.train \
+  --model_factory your_package.factories:build_model \
+  --train_dataloader_factory your_package.factories:build_train_dataloader \
+  --eval_dataloader_factory your_package.factories:build_eval_dataloader \
+  --tokenizer_factory your_package.factories:build_tokenizer \
+  --train_file data/processed/train.jsonl \
+  --eval_file data/processed/valid.jsonl \
+  --output_dir checkpoints \
+  --num_epochs 5 \
+  --learning_rate 5e-4 \
+  --batch_size 32 \
+  --gradient_accumulation_steps 2 \
+  --label_smoothing 0.1 \
+  --warmup_ratio 0.1 \
+  --scheduler_type linear \
+  --max_grad_norm 1.0 \
+  --eval_steps 200 \
+  --save_steps 200 \
+  --metric_for_best_model eval/bleu \
+  --wandb_enabled true \
+  --wandb_project machine-translation
+```
+
+Equivalent command via launcher:
+
+```bash
+python scripts/train.py --help
+```
+
+Optional W&B environment setup:
+
+```bash
+# .env or shell
+WANDB_API_KEY=your_key_here
+WANDB_PROJECT=machine-translation
+```
+
