@@ -257,14 +257,36 @@ def evaluate_model(
                     references.extend([""] * len(_decode_token_batch(tokenizer, pred_tokens, ignore_index)))
             elif isinstance(batch, (tuple, list)) and len(batch) >= 2:
                 inputs, labels = batch[0], batch[1]
-                if hasattr(model, "generate") and torch.is_tensor(inputs):
-                    pred_tokens = model.generate(inputs, **generation_kwargs)
-                else:
-                    outputs = model(inputs)
-                    logits = outputs.logits if hasattr(outputs, "logits") else outputs
+
+                if hasattr(model, "greedy_decode") and torch.is_tensor(inputs):
+                    bos_token_id = generation_kwargs.get("bos_token_id", 1)
+                    max_length = generation_kwargs.get("max_length", labels.size(1))
+
+                    outputs = model.greedy_decode(
+                        src=inputs,
+                        bos_token_id=bos_token_id,
+                        max_length=max_length,
+                    )
+
+                    logits = outputs[0] if isinstance(outputs, (tuple, list)) else outputs
                     pred_tokens = logits.argmax(dim=-1)
+
+                else:
+                    outputs = model(inputs, labels)
+
+                    if isinstance(outputs, (tuple, list)):
+                        logits = outputs[0]
+                    elif hasattr(outputs, "logits"):
+                        logits = outputs.logits
+                    elif isinstance(outputs, dict):
+                        logits = outputs["logits"]
+                    else:
+                        logits = outputs
+
+                    pred_tokens = logits.argmax(dim=-1)
+
                 predictions.extend(_decode_token_batch(tokenizer, pred_tokens, ignore_index))
-                references.extend(_decode_token_batch(tokenizer, labels, ignore_index))
+                references.extend(_decode_token_batch(tokenizer, labels[:, 1:], ignore_index))
             else:
                 raise ValueError("Unsupported batch format for evaluation.")
 

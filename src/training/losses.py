@@ -100,11 +100,19 @@ def maybe_compute_loss_from_outputs(
         logits = outputs.logits
     elif isinstance(outputs, dict) and "logits" in outputs:
         logits = outputs["logits"]
+    elif isinstance(outputs, (tuple, list)) and len(outputs) > 0:
+        if torch.is_tensor(outputs[0]):
+            logits = outputs[0]
     elif torch.is_tensor(outputs):
         logits = outputs
 
     if logits is None or labels is None:
         raise RuntimeError("Unable to compute loss: missing logits and/or labels.")
+    
+    if logits.ndim == 3 and labels.ndim == 2:
+        # logits: (B, T-1, V), labels: (B, T)
+        if labels.size(1) == logits.size(1) + 1:
+            labels = labels[:, 1:]
 
     return compute_mt_loss(logits, labels, label_smoothing=label_smoothing, ignore_index=ignore_index)
 
