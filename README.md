@@ -163,6 +163,8 @@ python -m src.cli.train \
   --wandb_project machine-translation
 ```
 
+Replace `src.factories:*` with real callable paths in your project.
+
 Equivalent command via launcher:
 
 ```bash
@@ -176,4 +178,3 @@ Optional W&B environment setup:
 WANDB_API_KEY=your_key_here
 WANDB_PROJECT=machine-translation
 ```
-

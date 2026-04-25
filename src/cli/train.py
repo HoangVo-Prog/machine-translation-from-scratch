@@ -15,8 +15,19 @@ def _load_callable(path: str):
         raise ValueError(
             f"Invalid callable path '{path}'. Use format: module.submodule:function_name"
         )
+    if path.startswith("your_package."):
+        raise ValueError(
+            "Placeholder factory path detected. Replace 'your_package' with your real module path, "
+            "for example: src.my_factories:build_model"
+        )
     module_name, fn_name = path.split(":", 1)
-    module = importlib.import_module(module_name)
+    try:
+        module = importlib.import_module(module_name)
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            f"Cannot import module '{module_name}' from '{path}'. "
+            "Use a real factory path like 'src.my_factories:build_model'."
+        ) from exc
     fn = getattr(module, fn_name, None)
     if fn is None or not callable(fn):
         raise ValueError(f"'{fn_name}' in module '{module_name}' is not callable.")
@@ -199,12 +210,19 @@ def main(argv: list[str] | None = None) -> int:
     config_from_json = _load_json_config(args.config_json)
     config = _merge_cli_flags_into_config(args, config_from_json)
 
-    model = _load_callable(args.model_factory)()
-    train_dataloader = _load_callable(args.train_dataloader_factory)()
-    eval_dataloader = (
-        _load_callable(args.eval_dataloader_factory)() if args.eval_dataloader_factory else None
-    )
-    tokenizer = _load_callable(args.tokenizer_factory)() if args.tokenizer_factory else None
+    try:
+        model = _load_callable(args.model_factory)()
+        train_dataloader = _load_callable(args.train_dataloader_factory)()
+        eval_dataloader = (
+            _load_callable(args.eval_dataloader_factory)() if args.eval_dataloader_factory else None
+        )
+        tokenizer = _load_callable(args.tokenizer_factory)() if args.tokenizer_factory else None
+    except Exception as exc:
+        raise ValueError(
+            f"Factory loading failed: {exc}\n"
+            "Tip: '--model_factory', '--train_dataloader_factory', '--eval_dataloader_factory', "
+            "and '--tokenizer_factory' must point to real callables in your codebase."
+        ) from exc
 
     result = train(
         model=model,
@@ -220,4 +238,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
