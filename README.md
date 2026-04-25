@@ -141,10 +141,10 @@ CLI implementation lives in `src/cli/train.py`.
 
 ```bash
 python -m src.cli.train \
-  --model_factory your_package.factories:build_model \
-  --train_dataloader_factory your_package.factories:build_train_dataloader \
-  --eval_dataloader_factory your_package.factories:build_eval_dataloader \
-  --tokenizer_factory your_package.factories:build_tokenizer \
+  --model_factory src.factories:build_model \
+  --train_dataloader_factory src.factories:build_train_dataloader \
+  --eval_dataloader_factory src.factories:build_eval_dataloader \
+  --tokenizer_factory src.factories:build_tokenizer \
   --train_file data/processed/train.jsonl \
   --eval_file data/processed/valid.jsonl \
   --output_dir checkpoints \
