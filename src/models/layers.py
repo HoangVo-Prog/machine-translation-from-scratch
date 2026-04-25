@@ -203,15 +203,21 @@ class GRU(nn.Module):
         return torch.zeros((self.hidden_size, 1), device=device)
 
     def step(self, x_t, h_prev):
-        x_t = x_t.view(-1, 1).to(self.W_z.device)
+        x_t = x_t.to(self.W_z.device)
         h_prev = h_prev.to(self.W_z.device)
 
-        concat = torch.cat((h_prev, x_t), dim=0)
-        z_t = sigmoid(self.W_z @ concat + self.b_z)
-        r_t = sigmoid(self.W_r @ concat + self.b_r)
+        if x_t.dim() == 1:
+            x_t = x_t.unsqueeze(0)
+        if h_prev.dim() == 1:
+            h_prev = h_prev.unsqueeze(0)
 
-        concat_reset = torch.cat((r_t * h_prev, x_t), dim=0)
-        h_tilde = tanh(self.W_h @ concat_reset + self.b_h)
+        concat = torch.cat((h_prev, x_t), dim=1)
+
+        z_t = sigmoid(concat @ self.W_z.T + self.b_z.T)
+        r_t = sigmoid(concat @ self.W_r.T + self.b_r.T)
+
+        concat_reset = torch.cat((r_t * h_prev, x_t), dim=1)
+        h_tilde = tanh(concat_reset @ self.W_h.T + self.b_h.T)
 
         h_t = (1 - z_t) * h_prev + z_t * h_tilde
         return h_t

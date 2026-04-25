@@ -4,6 +4,10 @@ class Vocabulary:
         self.itos = {0: "<pad>", 1: "<sos>", 2: "<eos>", 3: "<unk>"}
         self.stoi = {"<pad>": 0, "<sos>": 1, "<eos>": 2, "<unk>": 3}
         self.freq_threshold = freq_threshold
+
+    def __len__(self):
+        return len(self.stoi)
+
     def build_vocabulary(self, sentence_list):
         # Xây dựng bộ từ điển từ danh sách các câu đã được tokenize.
         frequencies = Counter()

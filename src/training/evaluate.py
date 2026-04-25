@@ -226,12 +226,11 @@ def evaluate_model(
             batch = _move_to_device(batch, active_device)
 
             if isinstance(batch, Mapping):
-                labels = (
-                    batch.get("labels")
-                    or batch.get("target_ids")
-                    or batch.get("targets")
-                    or batch.get("y")
-                )
+                labels = None
+                for key in ["labels", "target_ids", "targets", "y"]:
+                    if key in batch:
+                        labels = batch[key]
+                        break
                 if hasattr(model, "generate"):
                     gen_inputs = {
                         k: v
