@@ -12,7 +12,7 @@ def label_smoothed_cross_entropy_loss(
     logits: torch.Tensor,
     labels: torch.Tensor,
     label_smoothing: float = 0.0,
-    ignore_index: int = -100,
+    ignore_index: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute label-smoothed and plain CE losses.
 
@@ -62,7 +62,7 @@ def compute_mt_loss(
     logits: torch.Tensor,
     labels: torch.Tensor,
     label_smoothing: float = 0.0,
-    ignore_index: int = -100,
+    ignore_index: int = 0
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Compute MT loss and return stable logging metrics."""
     total_loss, ce_loss = label_smoothed_cross_entropy_loss(
@@ -83,7 +83,7 @@ def maybe_compute_loss_from_outputs(
     outputs: Any,
     labels: torch.Tensor | None = None,
     label_smoothing: float = 0.0,
-    ignore_index: int = -100,
+    ignore_index: int = 0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Use model-provided loss when available, else compute from logits/labels."""
     if hasattr(outputs, "loss") and outputs.loss is not None:

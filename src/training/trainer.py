@@ -237,7 +237,7 @@ def train(
     logging_steps = int(_cfg(config, "logging_steps", 10))
     eval_steps = _cfg(config, "eval_steps", None)
     save_steps = _cfg(config, "save_steps", None)
-    ignore_index = int(_cfg(config, "ignore_index", -100))
+    ignore_index = int(_cfg(config, "ignore_index", 0))
     label_smoothing = float(_cfg(config, "label_smoothing", 0.0))
     max_grad_norm = float(_cfg(config, "max_grad_norm", 1.0))
     metric_for_best = str(_cfg(config, "metric_for_best_model", "eval/bleu"))
