@@ -1,9 +1,8 @@
 import random
 import torch
 
-# Lớp TranslationDataset: Kết nối dữ liệu thô với các bộ Tokenizer và Vocabulary
 class TranslationDataset:
-    def __init__(self, src_texts, trg_texts, vocab_src, vocab_trg, tokenizer_src, tokenizer_trg, max_len=0.95):
+    def __init__(self, src_texts, trg_texts, vocab_src, vocab_trg, tokenizer_src, tokenizer_trg, max_len=128):
         self.max_len = max_len
         self.src_texts = src_texts
         self.trg_texts = trg_texts
@@ -13,111 +12,76 @@ class TranslationDataset:
         self.tokenizer_trg = tokenizer_trg
 
     def __getitem__(self, idx):
-        # Tokenize source and target
-        if hasattr(self.tokenizer_src, "encode"):
-            src_tokens = self.tokenizer_src.encode(self.src_texts[idx])
-        else:
-            src_tokens = self.tokenizer_src(self.src_texts[idx])
+        # 1. Tokenize
+        src_tokens = self.tokenizer_src.encode(self.src_texts[idx]) if hasattr(self.tokenizer_src, "encode") else self.tokenizer_src(self.src_texts[idx])
+        trg_tokens = self.tokenizer_trg.encode(self.trg_texts[idx]) if hasattr(self.tokenizer_trg, "encode") else self.tokenizer_trg(self.trg_texts[idx])
 
-        if hasattr(self.tokenizer_trg, "encode"):
-            trg_tokens = self.tokenizer_trg.encode(self.trg_texts[idx])
-        else:
-            trg_tokens = self.tokenizer_trg(self.trg_texts[idx])
+        # 2. Cắt câu nếu quá dài (Tránh nổ bộ nhớ)
+        src_tokens = src_tokens[:self.max_len - 2] # -2 cho sos và eos
+        trg_tokens = trg_tokens[:self.max_len - 2]
 
-        src_limit = self._token_limit(src_tokens)
-        trg_limit = self._token_limit(trg_tokens)
+        # 3. Chuyển sang ID số
+        src_ids = [self.vocab_src.stoi["<sos>"]] + self.vocab_src.numericalize(src_tokens) + [self.vocab_src.stoi["<eos>"]]
+        trg_ids = [self.vocab_trg.stoi["<sos>"]] + self.vocab_trg.numericalize(trg_tokens) + [self.vocab_trg.stoi["<eos>"]]
 
-        src_tokens = src_tokens[:src_limit]
-        trg_tokens = trg_tokens[:trg_limit]
-
-        # Numericalize tokens (convert string tokens to integer IDs)
-        src_tokens = self.vocab_src.numericalize(src_tokens)
-        trg_tokens = self.vocab_trg.numericalize(trg_tokens)
-
-        # Add <sos> and <eos>
-        src_tokens = [self.vocab_src.stoi["<sos>"]] + src_tokens + [self.vocab_src.stoi["<eos>"]]
-        trg_tokens = [self.vocab_trg.stoi["<sos>"]] + trg_tokens + [self.vocab_trg.stoi["<eos>"]]
-
-        # Padding to max_len
-        src_tokens = self._pad_sequence(src_tokens, self.vocab_src.stoi["<pad>"], src_limit)
-        trg_tokens = self._pad_sequence(trg_tokens, self.vocab_trg.stoi["<pad>"], trg_limit)
-
-        return torch.tensor(src_tokens, dtype=torch.long), torch.tensor(trg_tokens, dtype=torch.long)
+        # KHÔNG PAD Ở ĐÂY - Trả về tensor độ dài thực thực tế
+        return torch.tensor(src_ids, dtype=torch.long), torch.tensor(trg_ids, dtype=torch.long)
 
     def __len__(self):
         return len(self.src_texts)
 
-    def _pad_sequence(self, tokens, pad_idx, token_limit):
-        pad_target = int(token_limit)
-        while len(tokens) < pad_target + 2:  # +2 for <sos> and <eos>
-            tokens.append(pad_idx)
-        return tokens
-
-    def _token_limit(self, tokens):
-        if isinstance(self.max_len, float) and 0 < self.max_len < 1:
-            return max(1, int(len(tokens) * self.max_len))
-        return int(self.max_len)
-
-# Lớp CollateBatch: Xử lý gộp các câu có độ dài khác nhau vào cùng một Batch
 class CollateBatch:
-    def __init__(self, pad_idx):
-        self.pad_idx = pad_idx
+    def __init__(self, pad_idx_src, pad_idx_trg):
+        self.pad_idx_src = pad_idx_src
+        self.pad_idx_trg = pad_idx_trg
 
     def __call__(self, batch):
-        # Tách riêng list câu Anh và Việt từ batch
-        en_batch = [item[0] for item in batch]
-        vi_batch = [item[1] for item in batch]
+        src_batch, trg_batch = zip(*batch)
 
-        # Padding động cho batch hiện tại
-        en_padded = self._pad_batch(en_batch)
-        vi_padded = self._pad_batch(vi_batch)
+        # Dynamic Padding: Chỉ pad đến câu dài nhất TRONG BATCH NÀY
+        src_padded = self._pad_sequences(src_batch, self.pad_idx_src)
+        trg_padded = self._pad_sequences(trg_batch, self.pad_idx_trg)
 
-        # Tạo padding mask (True tại vị trí số 0/padding)
-        en_mask = (en_padded == self.pad_idx)
-        vi_mask = (vi_padded == self.pad_idx)
+        # Tạo mask: Vị trí nào là padding thì True (hoặc 1)
+        # Lưu ý: Transformer thường cần mask kiểu (batch, 1, 1, seq_len) hoặc (batch, seq_len)
+        src_mask = (src_padded == self.pad_idx_src)
+        trg_mask = (trg_padded == self.pad_idx_trg)
 
-        return en_padded, vi_padded, en_mask, vi_mask
+        return src_padded, trg_padded, src_mask, trg_mask
 
-    def _pad_batch(self, batch):
-        # Find the max length in the batch and pad all sequences to that length
-        max_len = max([len(seq) for seq in batch])
-        return torch.stack([torch.cat([seq, torch.tensor([self.pad_idx] * (max_len - len(seq)), dtype=torch.long)]) for seq in batch])
+    def _pad_sequences(self, sequences, pad_idx):
+        max_len = max([len(seq) for seq in sequences])
+        # Tạo tensor chứa toàn pad_idx trước
+        padded_seqs = torch.full((len(sequences), max_len), pad_idx, dtype=torch.long)
+        # Copy dữ liệu thực vào
+        for i, seq in enumerate(sequences):
+            padded_seqs[i, :len(seq)] = seq
+        return padded_seqs
 
-# Hàm khởi tạo DataLoader để cung cấp dữ liệu cho quá trình huấn luyện
-def get_dataloader(src_texts, trg_texts, vocab_src, vocab_trg, tokenizer_src, tokenizer_trg, batch_size=32, max_len=50, shuffle=False):
+def get_dataloader(src_texts, trg_texts, vocab_src, vocab_trg, tokenizer_src, tokenizer_trg, batch_size=32, max_len=128, shuffle=False):
     dataset = TranslationDataset(src_texts, trg_texts, vocab_src, vocab_trg, tokenizer_src, tokenizer_trg, max_len=max_len)
-
-    collate_fn = CollateBatch(pad_idx=vocab_src.stoi['<pad>'])
+    
+    # Pass cả 2 pad_idx để an toàn
+    collate_fn = CollateBatch(pad_idx_src=vocab_src.stoi['<pad>'], pad_idx_trg=vocab_trg.stoi['<pad>'])
+    
     return TranslationDataLoader(dataset, batch_size, collate_fn, shuffle=shuffle)
 
 class TranslationDataLoader:
-    def __init__(self, dataset, batch_size, collate_fn, shuffle: bool = False):
+    def __init__(self, dataset, batch_size, collate_fn, shuffle=False):
         self.dataset = dataset
         self.batch_size = batch_size
         self.collate_fn = collate_fn
+        self.indices = list(range(len(dataset)))
         self.shuffle = shuffle
+
+    def __iter__(self):
+        if self.shuffle:
+            random.shuffle(self.indices)
+        
+        for i in range(0, len(self.indices), self.batch_size):
+            batch_idxs = self.indices[i : i + self.batch_size]
+            batch_samples = [self.dataset[idx] for idx in batch_idxs]
+            yield self.collate_fn(batch_samples)
 
     def __len__(self):
         return (len(self.dataset) + self.batch_size - 1) // self.batch_size
-
-    def __iter__(self):
-        indices = list(range(len(self.dataset)))
-        if self.shuffle:
-            random.shuffle(indices)
-
-        for start_idx in range(0, len(indices), self.batch_size):
-            batch_indices = indices[start_idx:start_idx + self.batch_size]
-            batch_data = [self.dataset[i] for i in batch_indices]
-            yield self.collate_fn(batch_data)
-
-
-def custom_dataloader(dataset, batch_size, collate_fn):
-    data_len = len(dataset)
-    indices = list(range(data_len))
-    
-    for start_idx in range(0, data_len, batch_size):
-        batch_indices = indices[start_idx:start_idx + batch_size]
-        batch_data = [dataset[i] for i in batch_indices]
-        
-        # Process batch using collate_fn
-        yield collate_fn(batch_data)

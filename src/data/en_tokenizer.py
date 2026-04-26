@@ -1,10 +1,13 @@
 import re
+import string
 
 class EnglishBPETokenizer:
     def __init__(self, num_merges=100, tokenizer_type="bpe"):
         self.num_merges = num_merges
         self.tokenizer_type = tokenizer_type
         self.merges = {}
+        # Lưu sẵn all_marks để dùng trong clean_text
+        self.all_marks = re.escape(string.punctuation)
         self.contractions = {
             "won't": "will not", "can't": "cannot", "i'm": "i am",
             "isn't": "is not", "aren't": "are not", "'m": " am",
@@ -12,15 +15,34 @@ class EnglishBPETokenizer:
             "'ve": " have", "'d": " would", "n't": " not"
         }
 
-    def clean_text(self, text):
+    def clean_text_en(self, text):
+        if not text:
+            return ""
+
+        # 1. Chuyển về chữ thường
         text = text.lower().strip()
-        for word in text.split():
-            if word in self.contractions:
-                text = text.replace(word, self.contractions[word])
-        text = re.sub(r"([.!?\"\(\),:;])", r" \1 ", text)
+
+        # 2. Xử lý viết tắt (Contractions)
+        words = text.split()
+        expanded_words = [self.contractions.get(w, w) for w in words]
+        text = " ".join(expanded_words)
+
+        # 3. Tách toàn bộ dấu câu
+        text = re.sub(f"([{self.all_marks}])", r" \1 ", text)
+
+        # 4. Xử lý số (Chuyển thành <num>)
         text = re.sub(r"\d+", " <num> ", text)
-        text = re.sub(r"[^a-zA-Z0-9.!?\"\(\),:;<num> ]+", r" ", text)
-        return re.sub(r"\s+", " ", text).strip()
+
+        # 5. Loại bỏ các ký tự lạ, giữ lại chữ, số, dấu câu và <>
+        valid_chars = f"a-z0-9 " + self.all_marks + r"<> "
+        text = re.sub(f"[^{valid_chars}]+", " ", text)
+
+        # 6. Xử lý khoảng trắng thừa
+        text = re.sub(r"\s+", " ", text).strip()
+        
+        return text
+
+    # --- Các hàm bổ trợ BPE ---
 
     def _get_stats(self, sequences):
         counts = {}
@@ -49,23 +71,21 @@ class EnglishBPETokenizer:
         return [char for char in word] + ["</w>"]
 
     def _apply_bpe(self, sequence):
-        while True:
-            found = False
-            for i in range(len(sequence) - 1):
-                pair = (sequence[i], sequence[i + 1])
-                if pair in self.merges:
-                    sequence = sequence[:i] + [self.merges[pair]] + sequence[i + 2:]
-                    found = True
-                    break
-            if not found:
-                break
+        # Tối ưu logic apply dựa trên merges đã học
+        for pair, new_symbol in self.merges.items():
+            i = 0
+            while i < len(sequence) - 1:
+                if (sequence[i], sequence[i + 1]) == pair:
+                    sequence = sequence[:i] + [new_symbol] + sequence[i + 2:]
+                else:
+                    i += 1
         return sequence
 
-    def train(self, corpus):
-        cleaned_corpus = [self.clean_text(text) for text in corpus]
-        if self.tokenizer_type == "whitespace":
-            return [text.split() for text in cleaned_corpus]
+    # --- Giao diện chính ---
 
+    def train(self, corpus):
+        cleaned_corpus = [self.clean_text_en(text) for text in corpus]
+        
         sequences = []
         for text in cleaned_corpus:
             for word in text.split():
@@ -80,10 +100,10 @@ class EnglishBPETokenizer:
             sequences = self._merge(sequences, top_pair, new_symbol)
             self.merges[top_pair] = new_symbol
 
-        return sequences
+        return self.merges
 
     def encode(self, text, max_len=None):
-        cleaned = self.clean_text(text)
+        cleaned = self.clean_text_en(text)
         if self.tokenizer_type == "whitespace":
             tokens = cleaned.split()
         else:
@@ -95,13 +115,4 @@ class EnglishBPETokenizer:
                 token = "".join(sequence).replace("</w>", "")
                 tokens.append(token)
 
-        if max_len is not None:
-            return tokens[:max_len]
-        return tokens
-
-    def tokenize(self, text, max_len=None):
-        return self.encode(text, max_len=max_len)
-
-
-def build_english_tokenizer(tokenizer_type="bpe", num_merges=100):
-    return EnglishBPETokenizer(num_merges=num_merges, tokenizer_type=tokenizer_type)
+        return tokens[:max_len] if max_len else tokens

@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import torch
 
 from src.models.encoder import Encoder
 from src.models.decoder import Decoder
@@ -139,11 +140,20 @@ class TargetVocabTokenizer:
         special = {"<pad>", "<sos>", "<eos>", "<unk>"}
         outputs = []
 
+        # Convert tensor to list if needed
+        if torch.is_tensor(sequences):
+            sequences = sequences.detach().cpu().tolist()
+
         for seq in sequences:
             tokens = []
 
             for idx in seq:
-                idx = int(idx)
+                # Handle tensor elements
+                if torch.is_tensor(idx):
+                    idx = int(idx.item())
+                else:
+                    idx = int(idx)
+                    
                 token = self.vocab_trg.itos.get(idx, "<unk>")
 
                 if skip_special_tokens and token in special:

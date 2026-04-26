@@ -1,6 +1,8 @@
 from collections import Counter
+
 class Vocabulary:
     def __init__(self, freq_threshold=2):
+        # Giữ nguyên các token đặc biệt
         self.itos = {0: "<pad>", 1: "<sos>", 2: "<eos>", 3: "<unk>"}
         self.stoi = {"<pad>": 0, "<sos>": 1, "<eos>": 2, "<unk>": 3}
         self.freq_threshold = freq_threshold
@@ -9,22 +11,20 @@ class Vocabulary:
         return len(self.stoi)
 
     def build_vocabulary(self, sentence_list):
-        # Xây dựng bộ từ điển từ danh sách các câu đã được tokenize.
         frequencies = Counter()
-        idx = max(self.itos.keys()) + 1
-
+        # 1. Đếm toàn bộ tần suất trước
         for sentence in sentence_list:
             for word in sentence:
-                if word in self.stoi:
-                    continue
-
                 frequencies[word] += 1
 
-                if frequencies[word] == self.freq_threshold:
-                    self.stoi[word] = idx
-                    self.itos[idx] = word
-                    idx += 1
+        # 2. Lọc và gán ID
+        idx = 4 # Bắt đầu sau các token đặc biệt
+        for word, freq in frequencies.items():
+            if freq >= self.freq_threshold and word not in self.stoi:
+                self.stoi[word] = idx
+                self.itos[idx] = word
+                idx += 1
 
     def numericalize(self, text_tokens):
-        # Chuyển đổi danh sách từ (tokens) thành danh sách các chỉ số (indexes).
-        return [self.stoi[token] if token in self.stoi else self.stoi["<unk>"] for token in text_tokens]
+        # Chuyển token thành ID, dùng <unk> nếu không có trong từ điển
+        return [self.stoi.get(token, self.stoi["<unk>"]) for token in text_tokens]

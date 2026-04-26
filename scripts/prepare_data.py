@@ -1,24 +1,18 @@
 import os
+import pandas as pd
 import json
 import random
 
 # ====== CONFIG ======
-SRC_FILE = "data/en_sents"
-TRG_FILE = "data/vi_sents"
+SRC_FILE = "data/PhoMT.csv"
 OUTPUT_DIR = "data/processed"
 TRAIN_RATIO = 0.9
 SEED = 42
 
 # ====== LOAD DATA ======
-with open(SRC_FILE, "r", encoding="utf-8") as f:
-    src_lines = [line.strip() for line in f if line.strip()]
+df = pd.read_csv(SRC_FILE, header=None, names=["EnglishSentences", "VietnameseSentences"])
 
-with open(TRG_FILE, "r", encoding="utf-8") as f:
-    trg_lines = [line.strip() for line in f if line.strip()]
-
-assert len(src_lines) == len(trg_lines), "Số dòng không khớp!"
-
-pairs = list(zip(src_lines, trg_lines))
+pairs = list(zip(df["EnglishSentences"], df["VietnameseSentences"]))
 
 # ====== SHUFFLE ======
 random.seed(SEED)
@@ -42,7 +36,7 @@ def save_jsonl(pairs, path):
             obj = {"src": src, "trg": trg}
             f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
-save_jsonl(train_pairs, os.path.join(OUTPUT_DIR, "train.jsonl"))
-save_jsonl(valid_pairs, os.path.join(OUTPUT_DIR, "valid.jsonl"))
+save_jsonl(train_pairs, os.path.join(OUTPUT_DIR, "train_phomt.jsonl"))
+save_jsonl(valid_pairs, os.path.join(OUTPUT_DIR, "valid_phomt.jsonl"))
 
 print("Done! Files saved to:", OUTPUT_DIR)
