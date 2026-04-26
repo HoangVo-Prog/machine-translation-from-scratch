@@ -30,6 +30,10 @@ class TranslationDataset:
         src_tokens = src_tokens[:src_limit]
         trg_tokens = trg_tokens[:trg_limit]
 
+        # Numericalize tokens (convert string tokens to integer IDs)
+        src_tokens = self.vocab_src.numericalize(src_tokens)
+        trg_tokens = self.vocab_trg.numericalize(trg_tokens)
+
         # Add <sos> and <eos>
         src_tokens = [self.vocab_src.stoi["<sos>"]] + src_tokens + [self.vocab_src.stoi["<eos>"]]
         trg_tokens = [self.vocab_trg.stoi["<sos>"]] + trg_tokens + [self.vocab_trg.stoi["<eos>"]]
