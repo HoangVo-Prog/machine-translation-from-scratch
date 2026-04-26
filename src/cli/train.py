@@ -116,7 +116,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wandb_project", type=str, default=None)
     parser.add_argument("--wandb_entity", type=str, default=None)
     parser.add_argument("--wandb_run_name", type=str, default=None)
+    parser.add_argument("--wandb_log_steps", type=int, default=None)
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--max_len", type=float, default=0.95)
+    parser.add_argument("--dropout", type=float, default=None)
+    parser.add_argument("--optimizer_type", type=str, default=None)
+    parser.add_argument("--early_stopping_patience", type=int, default=None)
+    parser.add_argument("--min_lr", type=float, default=None)
+    parser.add_argument("--generation_temperature", type=float, default=None)
+    parser.add_argument("--generation_top_k", type=int, default=None)
+    parser.add_argument("--generation_top_p", type=float, default=None)
+    parser.add_argument("--generation_repetition_penalty", type=float, default=None)
 
     return parser
 
@@ -131,7 +141,9 @@ def _merge_cli_flags_into_config(args, config):
         "label_smoothing", "warmup_steps", "warmup_ratio",
         "scheduler_type", "max_grad_norm", "eval_steps",
         "save_steps", "logging_steps", "metric_for_best_model",
-        "wandb_mode", "wandb_project", "wandb_entity", "wandb_run_name",
+        "wandb_mode", "wandb_project", "wandb_entity", "wandb_run_name", "wandb_log_steps",
+        "dropout", "optimizer_type", "early_stopping_patience", "min_lr",
+        "generation_temperature", "generation_top_k", "generation_top_p", "generation_repetition_penalty",
     ]
 
     for key in direct_keys:

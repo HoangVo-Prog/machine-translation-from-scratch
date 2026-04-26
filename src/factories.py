@@ -1,16 +1,12 @@
 import json
 from pathlib import Path
 
-import torch
-from torch.utils.data import DataLoader, Subset
-from torch.nn.utils.rnn import pad_sequence
-
 from src.models.encoder import Encoder
 from src.models.decoder import Decoder
 from src.models.seq2seq import Seq2Seq
 from src.models.attentions import BahdanauAttention
 
-from src.data.dataset import TranslationDataset
+from src.data.dataset import get_dataloader
 from src.data.vocab import Vocabulary
 from src.data.vi_tokenizer import tokenize_vi
 from src.data.en_tokenizer import EnglishBPETokenizer
@@ -134,30 +130,6 @@ def _get_shared_objects(config=None):
     return _CACHE["objects"]
 
 
-class TrainCollateBatch:
-    def __init__(self, src_pad_idx, trg_pad_idx):
-        self.src_pad_idx = src_pad_idx
-        self.trg_pad_idx = trg_pad_idx
-
-    def __call__(self, batch):
-        src_batch = [torch.tensor(item[0], dtype=torch.long) for item in batch]
-        trg_batch = [torch.tensor(item[1], dtype=torch.long) for item in batch]
-
-        src_padded = pad_sequence(
-            src_batch,
-            batch_first=True,
-            padding_value=self.src_pad_idx,
-        )
-
-        trg_padded = pad_sequence(
-            trg_batch,
-            batch_first=True,
-            padding_value=self.trg_pad_idx,
-        )
-
-        return src_padded, trg_padded
-
-
 class TargetVocabTokenizer:
     def __init__(self, vocab_trg):
         self.vocab_trg = vocab_trg
@@ -195,25 +167,19 @@ def build_train_dataloader(config=None):
     src_texts, trg_texts = _build_data(config, split="train")
     tokenizer_src, vocab_src, vocab_trg = _get_shared_objects(config)
 
-    dataset = TranslationDataset(
-        src_texts,
-        trg_texts,
-        vocab_src,
-        vocab_trg,
-        tokenizer_src.encode,
-        tokenize_vi,
-    )
-
     batch_size = int(_cfg(config, "batch_size", 32))
+    max_len = _cfg(config, "max_len", 0.95)
 
-    return DataLoader(
-        dataset,
+    return get_dataloader(
+        src_texts=src_texts,
+        trg_texts=trg_texts,
+        vocab_src=vocab_src,
+        vocab_trg=vocab_trg,
+        tokenizer_src=tokenizer_src.encode,
+        tokenizer_trg=tokenize_vi,
         batch_size=batch_size,
+        max_len=max_len,
         shuffle=True,
-        collate_fn=TrainCollateBatch(
-            src_pad_idx=vocab_src.stoi["<pad>"],
-            trg_pad_idx=vocab_trg.stoi["<pad>"],
-        ),
     )
 
 
@@ -221,30 +187,25 @@ def build_eval_dataloader(config=None):
     src_texts, trg_texts = _build_data(config, split="eval")
     tokenizer_src, vocab_src, vocab_trg = _get_shared_objects(config)
 
-    dataset = TranslationDataset(
-        src_texts,
-        trg_texts,
-        vocab_src,
-        vocab_trg,
-        tokenizer_src.encode,
-        tokenize_vi,
-    )
-
     eval_max_samples = _cfg(config, "eval_max_samples", 2000)
     if eval_max_samples is not None:
-        eval_max_samples = min(int(eval_max_samples), len(dataset))
-        dataset = Subset(dataset, range(eval_max_samples))
+        eval_max_samples = min(int(eval_max_samples), len(src_texts))
+        src_texts = src_texts[:eval_max_samples]
+        trg_texts = trg_texts[:eval_max_samples]
 
     batch_size = int(_cfg(config, "eval_batch_size", _cfg(config, "batch_size", 32)))
+    max_len = _cfg(config, "max_len", 0.95)
 
-    return DataLoader(
-        dataset,
+    return get_dataloader(
+        src_texts=src_texts,
+        trg_texts=trg_texts,
+        vocab_src=vocab_src,
+        vocab_trg=vocab_trg,
+        tokenizer_src=tokenizer_src.encode,
+        tokenizer_trg=tokenize_vi,
         batch_size=batch_size,
+        max_len=max_len,
         shuffle=False,
-        collate_fn=TrainCollateBatch(
-            src_pad_idx=vocab_src.stoi["<pad>"],
-            trg_pad_idx=vocab_trg.stoi["<pad>"],
-        ),
     )
 
 
@@ -256,6 +217,7 @@ def build_model(config=None):
     attention_dim = int(_cfg(config, "attention_dim", 32))
     num_layers = int(_cfg(config, "num_layers", 1))
     cell_type = str(_cfg(config, "cell_type", "gru"))
+    dropout = float(_cfg(config, "dropout", 0.1))
 
     encoder = Encoder(
         vocab_size=len(vocab_src),
@@ -263,6 +225,7 @@ def build_model(config=None):
         hidden_size=hidden_size,
         num_layers=num_layers,
         cell_type=cell_type,
+        dropout=dropout,
     )
 
     attention = BahdanauAttention(
@@ -278,6 +241,7 @@ def build_model(config=None):
         num_layers=num_layers,
         cell_type=cell_type,
         attention=attention,
+        dropout=dropout,
         eos_token_id=vocab_trg.stoi["<eos>"],
     )
 

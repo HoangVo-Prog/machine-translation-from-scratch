@@ -160,7 +160,47 @@ python -m src.cli.train \
   --save_steps 200 \
   --metric_for_best_model eval/bleu \
   --wandb_enabled true \
-  --wandb_project machine-translation
+  --wandb_project machine-translation \
+  --dropout 0.1 \
+  --optimizer_type adamw \
+  --early_stopping_patience 5 \
+  --wandb_log_steps 100
+```
+
+### Additional Training Parameters
+
+For fine-tuning and experimentation, you can add these optional parameters:
+
+- `--dropout 0.1`: Dropout probability for model layers (default: 0.1)
+- `--optimizer_type adamw`: Optimizer type: 'adam', 'adamw', or 'sgd' (default: 'adamw')
+- `--early_stopping_patience 5`: Stop training if no improvement after N evaluations (default: None)
+- `--min_lr 1e-6`: Minimum learning rate for scheduler (default: 1e-6)
+- `--wandb_log_steps 100`: Log to W&B every N steps instead of every logging step (default: 100)
+- `--generation_temperature 1.0`: Temperature for generation sampling (default: None)
+- `--generation_top_k 50`: Top-K for generation (default: None)
+- `--generation_top_p 0.9`: Top-P for generation (default: None)
+- `--generation_repetition_penalty 1.1`: Repetition penalty for generation (default: None)
+
+Example with custom settings:
+
+```bash
+python -m src.cli.train \
+  --model_factory src.factories:build_model \
+  --train_dataloader_factory src.factories:build_train_dataloader \
+  --eval_dataloader_factory src.factories:build_eval_dataloader \
+  --tokenizer_factory src.factories:build_tokenizer \
+  --train_file data/processed/train.jsonl \
+  --eval_file data/processed/valid.jsonl \
+  --output_dir checkpoints \
+  --num_epochs 10 \
+  --learning_rate 1e-3 \
+  --batch_size 64 \
+  --dropout 0.2 \
+  --optimizer_type adam \
+  --early_stopping_patience 3 \
+  --wandb_enabled true \
+  --wandb_log_steps 50 \
+  --generation_temperature 0.8
 ```
 
 Equivalent command via launcher:

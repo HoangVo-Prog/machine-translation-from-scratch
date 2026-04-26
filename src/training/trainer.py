@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import csv
 import logging
 import os
 from collections.abc import Mapping
@@ -112,6 +113,8 @@ def _forward_model(model: torch.nn.Module, batch: Any) -> Any:
     if isinstance(batch, Mapping):
         return model(**batch)
     if isinstance(batch, (tuple, list)):
+        if len(batch) >= 2 and torch.is_tensor(batch[0]) and torch.is_tensor(batch[1]):
+            return model(batch[0], batch[1])
         return model(*batch)
     return model(batch)
 
@@ -213,6 +216,103 @@ def _compute_total_training_steps(
     return steps_per_epoch * max(1, num_epochs)
 
 
+def _decode_predictions(tokenizer: Any, sequences: Any, ignore_index: int = -100) -> list[str]:
+    if tokenizer is not None and hasattr(tokenizer, "batch_decode"):
+        return tokenizer.batch_decode(sequences, skip_special_tokens=True)
+
+    if torch.is_tensor(sequences):
+        sequences = sequences.detach().cpu().tolist()
+    if isinstance(sequences, (tuple, list)) and sequences and not isinstance(sequences[0], str):
+        return [" ".join(str(int(tok)) for tok in seq if int(tok) != ignore_index) for seq in sequences]
+    return [str(sequences)] if sequences is not None else []
+
+
+def _append_translation_samples(csv_path: Path, rows: list[list[Any]]) -> None:
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    file_exists = csv_path.exists()
+    with csv_path.open("a", newline="", encoding="utf-8") as csvfile:
+        writer = csv.writer(csvfile)
+        if not file_exists:
+            writer.writerow(["epoch", "source", "reference", "prediction"])
+        writer.writerows(rows)
+
+
+def _get_fixed_eval_samples(eval_dataloader: Any, num_samples: int = 5) -> tuple[list[tuple[str, str]], torch.Tensor | None, torch.Tensor | None]:
+    dataset = getattr(eval_dataloader, "dataset", None)
+    if dataset is None:
+        return [], None, None
+
+    total = min(num_samples, len(dataset))
+    if total == 0:
+        return [], None, None
+
+    raw_pairs = [(dataset.src_texts[i], dataset.trg_texts[i]) for i in range(total)]
+    batch = None
+
+    if hasattr(eval_dataloader, "collate_fn"):
+        batch = eval_dataloader.collate_fn([dataset[i] for i in range(total)])
+
+    if isinstance(batch, (tuple, list)) and len(batch) >= 2:
+        return raw_pairs, batch[0], batch[1]
+
+    samples = [dataset[i] for i in range(total)]
+    if not samples:
+        return [], None, None
+
+    src_batch = torch.stack([item[0] for item in samples])
+    tgt_batch = torch.stack([item[1] for item in samples])
+    return raw_pairs, src_batch, tgt_batch
+
+
+def _write_epoch_sample_translations(
+    epoch: int,
+    model: torch.nn.Module,
+    eval_dataloader: Any,
+    tokenizer: Any | None,
+    output_dir: Path,
+    generation_kwargs: dict[str, Any],
+    num_samples: int = 5,
+) -> None:
+    raw_pairs, src_batch, _ = _get_fixed_eval_samples(eval_dataloader, num_samples=num_samples)
+    if not raw_pairs or src_batch is None:
+        return
+
+    model.eval()
+    with torch.no_grad():
+        src_batch = src_batch.to(next(model.parameters()).device)
+        dataset = getattr(eval_dataloader, "dataset", None)
+        bos_token_id = None
+        if dataset is not None and hasattr(dataset, "vocab_trg"):
+            bos_token_id = dataset.vocab_trg.stoi.get("<sos>")
+        if bos_token_id is None:
+            bos_token_id = 1
+
+        max_length = int(generation_kwargs.get("max_length", max(50, src_batch.shape[1] + 20)))
+        try:
+            pred_tokens = model.greedy_decode(
+                src_batch,
+                bos_token_id=bos_token_id,
+                src_lengths=None,
+                max_length=max_length,
+            )
+        except Exception:
+            LOGGER.warning("Epoch %s: unable to generate translation samples; skipping sample logging.", epoch)
+            return
+
+    predictions = _decode_predictions(tokenizer, pred_tokens)
+    rows: list[list[Any]] = []
+
+    LOGGER.info("epoch=%s translation samples:", epoch)
+    for index, ((source, reference), prediction) in enumerate(zip(raw_pairs, predictions), start=1):
+        LOGGER.info("epoch=%s sample=%s src=%s", epoch, index, source)
+        LOGGER.info("epoch=%s sample=%s ref=%s", epoch, index, reference)
+        LOGGER.info("epoch=%s sample=%s pred=%s", epoch, index, prediction)
+        rows.append([epoch, source, reference, prediction])
+
+    csv_path = output_dir / "translation_samples.csv"
+    _append_translation_samples(csv_path, rows)
+
+
 def train(
     model: torch.nn.Module,
     train_dataloader: Any,
@@ -243,6 +343,21 @@ def train(
     metric_for_best = str(_cfg(config, "metric_for_best_model", "eval/bleu"))
     greater_is_better = bool(_cfg(config, "greater_is_better", True))
     generation_kwargs = copy.deepcopy(_cfg(config, "generation_kwargs", {}))
+    wandb_log_steps = int(_cfg(config, "wandb_log_steps", 100))
+    dropout = float(_cfg(config, "dropout", 0.1))
+    optimizer_type = str(_cfg(config, "optimizer_type", "adamw"))
+    early_stopping_patience = _cfg(config, "early_stopping_patience", None)
+    min_lr = float(_cfg(config, "min_lr", 1e-6))
+
+    # Merge generation kwargs from CLI
+    if _cfg(config, "generation_temperature", None) is not None:
+        generation_kwargs["temperature"] = float(_cfg(config, "generation_temperature"))
+    if _cfg(config, "generation_top_k", None) is not None:
+        generation_kwargs["top_k"] = int(_cfg(config, "generation_top_k"))
+    if _cfg(config, "generation_top_p", None) is not None:
+        generation_kwargs["top_p"] = float(_cfg(config, "generation_top_p"))
+    if _cfg(config, "generation_repetition_penalty", None) is not None:
+        generation_kwargs["repetition_penalty"] = float(_cfg(config, "generation_repetition_penalty"))
 
     total_steps = _compute_total_training_steps(train_dataloader, num_epochs, grad_accum_steps, max_steps)
     optimizer = build_optimizer(model, config)
@@ -256,6 +371,7 @@ def train(
     best_checkpoint: str | None = None
     last_checkpoint: str | None = None
     global_step = 0
+    early_stopping_counter = 0
 
     optimizer.zero_grad(set_to_none=True)
 
@@ -300,6 +416,7 @@ def train(
 
             if global_step % logging_steps == 0:
                 LOGGER.info("step=%s %s", global_step, train_logs)
+            if wandb_run is not None and global_step % wandb_log_steps == 0:
                 _wandb_log(wandb_run, train_logs, step=global_step)
 
             if eval_dataloader is not None and eval_steps and global_step % int(eval_steps) == 0:
@@ -319,6 +436,7 @@ def train(
                     improved = current_metric > best_metric if greater_is_better else current_metric < best_metric
                     if improved:
                         best_metric = current_metric
+                        early_stopping_counter = 0
                         best_checkpoint = _save_checkpoint(
                             model=model,
                             optimizer=optimizer,
@@ -334,6 +452,11 @@ def train(
                                 "metric_for_best_model": metric_for_best,
                             },
                         )
+                    else:
+                        early_stopping_counter += 1
+                        if early_stopping_patience and early_stopping_counter >= early_stopping_patience:
+                            LOGGER.info("Early stopping triggered after %s epochs without improvement.", early_stopping_patience)
+                            break
 
             if save_steps and global_step % int(save_steps) == 0:
                 last_checkpoint = _save_checkpoint(
@@ -352,6 +475,16 @@ def train(
 
         if max_steps is not None and global_step >= int(max_steps):
             break
+
+        if eval_dataloader is not None:
+            _write_epoch_sample_translations(
+                epoch=epoch + 1,
+                model=model,
+                eval_dataloader=eval_dataloader,
+                tokenizer=tokenizer,
+                output_dir=output_dir,
+                generation_kwargs=generation_kwargs,
+            )
 
     if eval_dataloader is not None and bool(_cfg(config, "run_eval_at_end", True)):
         final_metrics = evaluate_model(

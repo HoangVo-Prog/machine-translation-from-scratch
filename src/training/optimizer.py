@@ -37,7 +37,8 @@ def _group_parameters_for_weight_decay(
 
 
 def build_optimizer(model: torch.nn.Module, config: Any) -> torch.optim.Optimizer:
-    """Build AdamW optimizer with optional parameter grouping."""
+    """Build optimizer based on type (Adam, AdamW, SGD)."""
+    optimizer_type = str(_get_config(config, "optimizer_type", "adamw")).lower()
     lr = float(_get_config(config, "learning_rate", _get_config(config, "lr", 5e-4)))
     weight_decay = float(_get_config(config, "weight_decay", 0.01))
     betas = _get_config(config, "betas", (0.9, 0.999))
@@ -48,6 +49,16 @@ def build_optimizer(model: torch.nn.Module, config: Any) -> torch.optim.Optimize
         params = _group_parameters_for_weight_decay(model, weight_decay=weight_decay)
     else:
         params = [p for p in model.parameters() if p.requires_grad]
+
+    if optimizer_type == "adam":
+        return torch.optim.Adam(params, lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+    elif optimizer_type == "adamw":
+        return torch.optim.AdamW(params, lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+    elif optimizer_type == "sgd":
+        momentum = float(_get_config(config, "momentum", 0.9))
+        return torch.optim.SGD(params, lr=lr, momentum=momentum, weight_decay=weight_decay)
+    else:
+        raise ValueError(f"Unsupported optimizer_type: {optimizer_type}. Use 'adam', 'adamw', or 'sgd'.")
 
     return torch.optim.AdamW(params, lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
 

@@ -1,14 +1,10 @@
 import re
-import os
-from collections import Counter
 
 class EnglishBPETokenizer:
-    def __init__(self, num_merges=100):
-        # Số lượng phép hợp nhất (merges) tối đa
+    def __init__(self, num_merges=100, tokenizer_type="bpe"):
         self.num_merges = num_merges
-        # Lưu trữ các quy tắc gộp (merges)
+        self.tokenizer_type = tokenizer_type
         self.merges = {}
-        # Danh sách các từ viết tắt tiếng Anh phổ biến (contractions)
         self.contractions = {
             "won't": "will not", "can't": "cannot", "i'm": "i am",
             "isn't": "is not", "aren't": "are not", "'m": " am",
@@ -17,90 +13,95 @@ class EnglishBPETokenizer:
         }
 
     def clean_text(self, text):
-        # Chuyển về chữ thường và loại bỏ khoảng trắng ở hai đầu
         text = text.lower().strip()
-        # Xử lý các từ viết tắt (contractions)
         for word in text.split():
             if word in self.contractions:
                 text = text.replace(word, self.contractions[word])
-        # Thêm khoảng trắng xung quanh các dấu câu
         text = re.sub(r"([.!?\"\(\),:;])", r" \1 ", text)
-        # Thay thế các chữ số bằng token <num>
         text = re.sub(r"\d+", " <num> ", text)
-        # Chỉ giữ lại các ký tự hợp lệ
         text = re.sub(r"[^a-zA-Z0-9.!?\"\(\),:;<num> ]+", r" ", text)
         return re.sub(r"\s+", " ", text).strip()
 
-    def get_stats(self, ids):
-        # Thống kê tần suất xuất hiện của các cặp byte cạnh nhau
+    def _get_stats(self, sequences):
         counts = {}
-        for word_id_list in ids:
-            for i in range(len(word_id_list) - 1):
-                pair = (word_id_list[i], word_id_list[i+1])
+        for seq in sequences:
+            for i in range(len(seq) - 1):
+                pair = (seq[i], seq[i + 1])
                 counts[pair] = counts.get(pair, 0) + 1
         return counts
 
-    def merge(self, ids, pair, idx):
-        # Gộp cặp byte đã chọn thành một ID mới
-        new_ids = []
-        for word_id_list in ids:
-            new_word = []
+    def _merge(self, sequences, pair, new_symbol):
+        merged = []
+        for seq in sequences:
+            new_seq = []
             i = 0
-            while i < len(word_id_list):
-                if i < len(word_id_list) - 1 and (word_id_list[i], word_id_list[i+1]) == pair:
-                    new_word.append(idx)
+            while i < len(seq):
+                if i < len(seq) - 1 and (seq[i], seq[i + 1]) == pair:
+                    new_seq.append(new_symbol)
                     i += 2
                 else:
-                    new_word.append(word_id_list[i])
+                    new_seq.append(seq[i])
                     i += 1
-            new_ids.append(new_word)
-        return new_ids
+            merged.append(new_seq)
+        return merged
+
+    def _to_symbol_sequence(self, word):
+        return [char for char in word] + ["</w>"]
+
+    def _apply_bpe(self, sequence):
+        while True:
+            found = False
+            for i in range(len(sequence) - 1):
+                pair = (sequence[i], sequence[i + 1])
+                if pair in self.merges:
+                    sequence = sequence[:i] + [self.merges[pair]] + sequence[i + 2:]
+                    found = True
+                    break
+            if not found:
+                break
+        return sequence
 
     def train(self, corpus):
-        # Huấn luyện tokenizer để tìm ra các quy tắc gộp BPE
         cleaned_corpus = [self.clean_text(text) for text in corpus]
-        # Chuyển văn bản thành danh sách byte (UTF-8 encoding)
-        ids = [list(text.encode("utf-8")) for text in cleaned_corpus]
-        vocab_size = 256 # Giá trị khởi đầu cho byte đơn
+        if self.tokenizer_type == "whitespace":
+            return [text.split() for text in cleaned_corpus]
+
+        sequences = []
+        for text in cleaned_corpus:
+            for word in text.split():
+                sequences.append(self._to_symbol_sequence(word))
+
         for i in range(self.num_merges):
-            stats = self.get_stats(ids)
-            if not stats: break
-            # Chọn cặp byte xuất hiện nhiều nhất để gộp (merge)
+            stats = self._get_stats(sequences)
+            if not stats:
+                break
             top_pair = max(stats, key=stats.get)
-            new_id = vocab_size + i
-            ids = self.merge(ids, top_pair, new_id)
-            self.merges[top_pair] = new_id
-        return ids
+            new_symbol = top_pair[0] + top_pair[1]
+            sequences = self._merge(sequences, top_pair, new_symbol)
+            self.merges[top_pair] = new_symbol
 
-    def encode(self, text):
-        # Mã hóa một đoạn văn bản thành danh sách subword tokens (chuỗi số)
-        text = self.clean_text(text)
-        tokens = list(text.encode("utf-8"))
-        while len(tokens) >= 2:
-            stats = {}
-            for i in range(len(tokens) - 1):
-                stats[(tokens[i], tokens[i+1])] = i
+        return sequences
 
-            # Tìm cặp merge có độ ưu tiên cao nhất dựa trên bộ quy tắc BPE đã huấn luyện
-            best_pair = None
-            for pair in self.merges:
-                if pair in stats:
-                    best_pair = pair
-                    break
+    def encode(self, text, max_len=None):
+        cleaned = self.clean_text(text)
+        if self.tokenizer_type == "whitespace":
+            tokens = cleaned.split()
+        else:
+            tokens = []
+            for word in cleaned.split():
+                sequence = self._to_symbol_sequence(word)
+                if self.tokenizer_type == "bpe":
+                    sequence = self._apply_bpe(sequence)
+                token = "".join(sequence).replace("</w>", "")
+                tokens.append(token)
 
-            if best_pair is None: break
+        if max_len is not None:
+            return tokens[:max_len]
+        return tokens
 
-            new_id = self.merges[best_pair]
-            new_tokens = []
-            i = 0
-            while i < len(tokens):
-                if i < len(tokens) - 1 and (tokens[i], tokens[i+1]) == best_pair:
-                    new_tokens.append(new_id)
-                    i += 2
-                else:
-                    new_tokens.append(tokens[i])
-                    i += 1
-            tokens = new_tokens
+    def tokenize(self, text, max_len=None):
+        return self.encode(text, max_len=max_len)
 
-        # Trả về các token dưới dạng chuỗi để đưa vào Vocabulary
-        return [str(t) for t in tokens]
+
+def build_english_tokenizer(tokenizer_type="bpe", num_merges=100):
+    return EnglishBPETokenizer(num_merges=num_merges, tokenizer_type=tokenizer_type)
