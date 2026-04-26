@@ -42,7 +42,7 @@ class TranslationDataset:
         src_tokens = self._pad_sequence(src_tokens, self.vocab_src.stoi["<pad>"], src_limit)
         trg_tokens = self._pad_sequence(trg_tokens, self.vocab_trg.stoi["<pad>"], trg_limit)
 
-        return torch.tensor(src_tokens), torch.tensor(trg_tokens)
+        return torch.tensor(src_tokens, dtype=torch.long), torch.tensor(trg_tokens, dtype=torch.long)
 
     def __len__(self):
         return len(self.src_texts)
@@ -65,8 +65,8 @@ class CollateBatch:
 
     def __call__(self, batch):
         # Tách riêng list câu Anh và Việt từ batch
-        en_batch = [torch.tensor(item[0]) for item in batch]
-        vi_batch = [torch.tensor(item[1]) for item in batch]
+        en_batch = [item[0] for item in batch]
+        vi_batch = [item[1] for item in batch]
 
         # Padding động cho batch hiện tại
         en_padded = self._pad_batch(en_batch)
@@ -81,7 +81,7 @@ class CollateBatch:
     def _pad_batch(self, batch):
         # Find the max length in the batch and pad all sequences to that length
         max_len = max([len(seq) for seq in batch])
-        return torch.stack([torch.cat([seq, torch.tensor([self.pad_idx] * (max_len - len(seq)))]) for seq in batch])
+        return torch.stack([torch.cat([seq, torch.tensor([self.pad_idx] * (max_len - len(seq)), dtype=torch.long)]) for seq in batch])
 
 # Hàm khởi tạo DataLoader để cung cấp dữ liệu cho quá trình huấn luyện
 def get_dataloader(src_texts, trg_texts, vocab_src, vocab_trg, tokenizer_src, tokenizer_trg, batch_size=32, max_len=50, shuffle=False):

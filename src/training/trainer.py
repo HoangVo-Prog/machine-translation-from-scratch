@@ -7,11 +7,12 @@ import csv
 import logging
 import os
 from collections.abc import Mapping
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
 import torch
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.nn.utils import clip_grad_norm_
 
 try:
@@ -364,7 +365,7 @@ def train(
     scheduler = build_scheduler(optimizer, config, total_steps)
 
     use_amp = bool(_cfg(config, "mixed_precision", False)) and active_device.type == "cuda"
-    scaler = GradScaler(enabled=use_amp)
+    scaler = GradScaler() if use_amp else None
     wandb_run = _init_wandb(config)
 
     best_metric = float("-inf") if greater_is_better else float("inf")
@@ -381,7 +382,8 @@ def train(
             batch = _move_to_device(batch, active_device)
             labels = _extract_labels(batch)
 
-            with autocast(enabled=use_amp):
+            autocast_context = autocast(device_type=active_device.type) if use_amp else nullcontext()
+            with autocast_context:
                 outputs = _forward_model(model, batch)
                 loss, loss_logs = maybe_compute_loss_from_outputs(
                     outputs=outputs,
@@ -391,18 +393,25 @@ def train(
                 )
 
             scaled_loss = loss / max(1, grad_accum_steps)
-            scaler.scale(scaled_loss).backward()
+            if scaler is not None:
+                scaler.scale(scaled_loss).backward()
+            else:
+                scaled_loss.backward()
 
             if step % grad_accum_steps != 0:
                 continue
 
             grad_norm = None
             if max_grad_norm > 0:
-                scaler.unscale_(optimizer)
+                if scaler is not None:
+                    scaler.unscale_(optimizer)
                 grad_norm = float(clip_grad_norm_(model.parameters(), max_grad_norm))
 
-            scaler.step(optimizer)
-            scaler.update()
+            if scaler is not None:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
             if scheduler is not None:

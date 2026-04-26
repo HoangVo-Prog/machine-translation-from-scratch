@@ -30,7 +30,7 @@ def label_smoothed_cross_entropy_loss(
 
     vocab_size = logits.size(-1)
     flat_logits = logits.reshape(-1, vocab_size)
-    flat_labels = labels.reshape(-1)
+    flat_labels = labels.reshape(-1).long()
 
     ce_loss = F.cross_entropy(
         flat_logits,
