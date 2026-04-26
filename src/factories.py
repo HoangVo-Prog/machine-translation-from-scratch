@@ -1,5 +1,7 @@
 import json
+import logging
 from pathlib import Path
+import torch
 
 from src.models.encoder import Encoder
 from src.models.decoder import Decoder
@@ -8,11 +10,12 @@ from src.models.attentions import BahdanauAttention
 
 from src.data.dataset import get_dataloader
 from src.data.vocab import Vocabulary
-from src.data.vi_tokenizer import tokenize_vi
+from src.data.vi_tokenizer import VietnameseTokenizer
 from src.data.en_tokenizer import EnglishBPETokenizer
 
 
 _CACHE = {}
+LOGGER = logging.getLogger(__name__)
 
 
 def _cfg(config, key, default=None):
@@ -25,6 +28,19 @@ def _cfg(config, key, default=None):
 
 def _repo_root():
     return Path(__file__).resolve().parent.parent
+
+
+def _normalize_max_len(raw_max_len, default: int = 128, min_len: int = 4) -> int:
+    try:
+        value = int(raw_max_len)
+    except (TypeError, ValueError):
+        LOGGER.warning("Invalid max_len=%r. Falling back to default=%s.", raw_max_len, default)
+        value = default
+
+    if value < min_len:
+        LOGGER.warning("max_len=%s is too small. Clamping to min_len=%s.", value, min_len)
+        value = min_len
+    return value
 
 
 def _read_jsonl_parallel(path: Path):
@@ -107,76 +123,45 @@ def _get_shared_objects(config=None):
 
     src_texts, trg_texts = _build_data(config, split="train")
 
-    tokenizer_src = EnglishBPETokenizer(num_merges=int(_cfg(config, "num_merges", 50)))
+    tokenizer_src = EnglishBPETokenizer(tokenizer_type="bpe", num_merges=int(_cfg(config, "num_merges", 50)))
     tokenizer_src.train(src_texts)
+
+    tokenizer_trg = VietnameseTokenizer(tokenizer_type="bpe", num_merges=int(_cfg(config, "num_merges", 50)))
+    tokenizer_trg.train(trg_texts)
 
     vocab_src = Vocabulary(freq_threshold=int(_cfg(config, "src_freq_threshold", 1)))
     vocab_trg = Vocabulary(freq_threshold=int(_cfg(config, "trg_freq_threshold", 1)))
 
-    src_tokens = [
-        ["<sos>"] + tokenizer_src.encode(text) + ["<eos>"]
-        for text in src_texts
-    ]
-
-    trg_tokens = [
-        ["<sos>"] + tokenize_vi(text) + ["<eos>"]
-        for text in trg_texts
-    ]
+    src_tokens = [["<sos>"] + tokenizer_src.encode(text) + ["<eos>"] for text in src_texts]
+    trg_tokens = [["<sos>"] + tokenizer_trg.encode(text) + ["<eos>"] for text in trg_texts]
 
     vocab_src.build_vocabulary(src_tokens)
     vocab_trg.build_vocabulary(trg_tokens)
 
-    _CACHE["objects"] = tokenizer_src, vocab_src, vocab_trg
+    _CACHE["objects"] = tokenizer_src, tokenizer_trg, vocab_src, vocab_trg
     return _CACHE["objects"]
 
 
-class TargetVocabTokenizer:
-    def __init__(self, vocab_trg):
-        self.vocab_trg = vocab_trg
-        self.pad_token_id = vocab_trg.stoi["<pad>"]
-
-    def batch_decode(self, sequences, skip_special_tokens=True):
-        special = {"<pad>", "<sos>", "<eos>", "<unk>"}
-        outputs = []
-
-        for seq in sequences:
-            tokens = []
-
-            for idx in seq:
-                idx = int(idx)
-                token = self.vocab_trg.itos.get(idx, "<unk>")
-
-                if skip_special_tokens and token in special:
-                    if token == "<eos>":
-                        break
-                    continue
-
-                tokens.append(token.replace("_", " "))
-
-            outputs.append(" ".join(tokens).strip())
-
-        return outputs
-
-
-def build_tokenizer(config=None):
-    _, _, vocab_trg = _get_shared_objects(config)
-    return TargetVocabTokenizer(vocab_trg)
+def build_tokenizer(config):
+    tokenizer_src = VietnameseTokenizer(tokenizer_type="bpe")
+    tokenizer_trg = EnglishBPETokenizer()
+    return tokenizer_src, tokenizer_trg
 
 
 def build_train_dataloader(config=None):
     src_texts, trg_texts = _build_data(config, split="train")
-    tokenizer_src, vocab_src, vocab_trg = _get_shared_objects(config)
+    tokenizer_src, tokenizer_trg, vocab_src, vocab_trg = _get_shared_objects(config)
 
     batch_size = int(_cfg(config, "batch_size", 32))
-    max_len = _cfg(config, "max_len", 0.95)
+    max_len = _normalize_max_len(_cfg(config, "max_len", 128))
 
     return get_dataloader(
         src_texts=src_texts,
         trg_texts=trg_texts,
         vocab_src=vocab_src,
         vocab_trg=vocab_trg,
-        tokenizer_src=tokenizer_src.encode,
-        tokenizer_trg=tokenize_vi,
+        tokenizer_src=tokenizer_src,
+        tokenizer_trg=tokenizer_trg,
         batch_size=batch_size,
         max_len=max_len,
         shuffle=True,
@@ -185,7 +170,7 @@ def build_train_dataloader(config=None):
 
 def build_eval_dataloader(config=None):
     src_texts, trg_texts = _build_data(config, split="eval")
-    tokenizer_src, vocab_src, vocab_trg = _get_shared_objects(config)
+    tokenizer_src, tokenizer_trg, vocab_src, vocab_trg = _get_shared_objects(config)
 
     eval_max_samples = _cfg(config, "eval_max_samples", 2000)
     if eval_max_samples is not None:
@@ -194,15 +179,15 @@ def build_eval_dataloader(config=None):
         trg_texts = trg_texts[:eval_max_samples]
 
     batch_size = int(_cfg(config, "eval_batch_size", _cfg(config, "batch_size", 32)))
-    max_len = _cfg(config, "max_len", 0.95)
+    max_len = _normalize_max_len(_cfg(config, "max_len", 128))
 
     return get_dataloader(
         src_texts=src_texts,
         trg_texts=trg_texts,
         vocab_src=vocab_src,
         vocab_trg=vocab_trg,
-        tokenizer_src=tokenizer_src.encode,
-        tokenizer_trg=tokenize_vi,
+        tokenizer_src=tokenizer_src,
+        tokenizer_trg=tokenizer_trg,
         batch_size=batch_size,
         max_len=max_len,
         shuffle=False,
@@ -210,7 +195,7 @@ def build_eval_dataloader(config=None):
 
 
 def build_model(config=None):
-    _, vocab_src, vocab_trg = _get_shared_objects(config)
+    tokenizer_src, tokenizer_trg, vocab_src, vocab_trg = _get_shared_objects(config)
 
     hidden_size = int(_cfg(config, "hidden_size", 64))
     embed_dim = int(_cfg(config, "embed_dim", 64))

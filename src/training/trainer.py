@@ -120,7 +120,7 @@ def _forward_model(model: torch.nn.Module, batch: Any) -> Any:
     return model(batch)
 
 
-def _init_wandb(config: Any) -> Any | None:
+def _init_wandb(config: Any, output_dir: Path) -> Any | None:
     enabled = bool(_cfg(config, "wandb_enabled", True))
     if not enabled:
         return None
@@ -150,16 +150,44 @@ def _init_wandb(config: Any) -> Any | None:
     if mode == "disabled":
         return None
 
+    run_id = _cfg(config, "wandb_id", None)
+    resume_enabled = bool(_cfg(config, "wandb_resume", False))
+    checkpoint_resume = _cfg(config, "resume_from_checkpoint", None) is not None
+    wandb_id_file = output_dir / "wandb_run_id.txt"
+    if run_id is None and (resume_enabled or checkpoint_resume) and wandb_id_file.exists():
+        try:
+            restored_id = wandb_id_file.read_text(encoding="utf-8").strip()
+            if restored_id:
+                run_id = restored_id
+                resume_enabled = True
+        except OSError:
+            pass
+
+    init_kwargs: dict[str, Any] = {
+        "project": _cfg(config, "wandb_project", "machine-translation"),
+        "entity": _cfg(config, "wandb_entity", None),
+        "name": _cfg(config, "wandb_run_name", None),
+        "group": _cfg(config, "wandb_group", None),
+        "tags": _cfg(config, "wandb_tags", None),
+        "mode": mode,
+        "config": _config_to_dict(config),
+    }
+    if run_id is not None:
+        init_kwargs["id"] = run_id
+    if resume_enabled:
+        init_kwargs["resume"] = "allow"
+
     try:
-        return wandb.init(
-            project=_cfg(config, "wandb_project", "machine-translation"),
-            entity=_cfg(config, "wandb_entity", None),
-            name=_cfg(config, "wandb_run_name", None),
-            group=_cfg(config, "wandb_group", None),
-            tags=_cfg(config, "wandb_tags", None),
-            mode=mode,
-            config=_config_to_dict(config),
-        )
+        wandb_run = wandb.init(**init_kwargs)
+        if wandb_run is not None:
+            try:
+                wandb_run_id = getattr(wandb_run, "id", None)
+                if wandb_run_id is not None:
+                    output_dir.mkdir(parents=True, exist_ok=True)
+                    wandb_id_file.write_text(str(wandb_run_id), encoding="utf-8")
+            except Exception:
+                pass
+        return wandb_run
     except Exception as exc:
         LOGGER.warning("wandb init failed (%s). Continuing with W&B disabled.", exc)
         return None
@@ -204,6 +232,39 @@ def _save_checkpoint(
         state.update(extra_state)
     torch.save(state, checkpoint_dir / "training_state.pt")
     return str(checkpoint_dir)
+
+
+def _load_checkpoint(
+    checkpoint_dir: Path,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: Any,
+    scaler: GradScaler | None,
+) -> dict[str, Any]:
+    if not checkpoint_dir.exists():
+        raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir}")
+
+    model_path = checkpoint_dir / "model.pt"
+    if not model_path.exists():
+        raise FileNotFoundError(f"Model checkpoint not found: {model_path}")
+
+    state_dict = torch.load(model_path, map_location="cpu")
+    model.load_state_dict(state_dict)
+
+    training_state = torch.load(checkpoint_dir / "training_state.pt", map_location="cpu")
+    optimizer.load_state_dict(training_state["optimizer"])
+
+    if scheduler is not None and training_state.get("scheduler") is not None:
+        scheduler.load_state_dict(training_state["scheduler"])
+
+    if scaler is not None and training_state.get("scaler") is not None:
+        scaler.load_state_dict(training_state["scaler"])
+
+    return {
+        "epoch": int(training_state.get("epoch", 0)),
+        "global_step": int(training_state.get("global_step", 0)),
+        "best_metric": training_state.get("best_metric", None),
+    }
 
 
 def _compute_total_training_steps(
@@ -366,17 +427,36 @@ def train(
 
     use_amp = bool(_cfg(config, "mixed_precision", False)) and active_device.type == "cuda"
     scaler = GradScaler() if use_amp else None
-    wandb_run = _init_wandb(config)
 
+    resume_checkpoint = _cfg(config, "resume_from_checkpoint", None)
+    start_epoch = 0
     best_metric = float("-inf") if greater_is_better else float("inf")
+    global_step = 0
+    if resume_checkpoint is not None:
+        checkpoint_path = Path(resume_checkpoint)
+        resume_state = _load_checkpoint(
+            checkpoint_dir=checkpoint_path,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+        )
+        start_epoch = min(resume_state.get("epoch", 0) + 1, num_epochs)
+        global_step = resume_state.get("global_step", 0)
+        if resume_state.get("best_metric") is not None:
+            best_metric = float(resume_state["best_metric"])
+
+    wandb_run = _init_wandb(config, output_dir)
+
     best_checkpoint: str | None = None
     last_checkpoint: str | None = None
-    global_step = 0
     early_stopping_counter = 0
+    current_epoch = start_epoch
 
     optimizer.zero_grad(set_to_none=True)
 
-    for epoch in range(num_epochs):
+    for epoch in range(start_epoch, num_epochs):
+        current_epoch = epoch
         model.train()
         for step, batch in enumerate(train_dataloader, start=1):
             batch = _move_to_device(batch, active_device)
@@ -515,7 +595,7 @@ def train(
         output_dir=output_dir,
         name="last",
         tokenizer=tokenizer,
-        extra_state={"global_step": global_step, "best_metric": best_metric},
+        extra_state={"epoch": current_epoch, "global_step": global_step, "best_metric": best_metric},
     )
 
     if wandb_run is not None:

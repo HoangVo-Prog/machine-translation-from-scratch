@@ -38,6 +38,8 @@ class BahdanauAttention(nn.Module):
         encoder_outputs: torch.Tensor,
         mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        decoder_hidden = decoder_hidden.to(encoder_outputs.device)
+
         decoder_features = self.decoder_projection(decoder_hidden).unsqueeze(1)
         encoder_features = self.encoder_projection(encoder_outputs)
         energy = torch.tanh(encoder_features + decoder_features)
@@ -81,6 +83,8 @@ class LuongAttention(nn.Module):
         encoder_outputs: torch.Tensor,
         mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        decoder_hidden = decoder_hidden.to(encoder_outputs.device)
+
         if self.score_method == "dot":
             if self.encoder_hidden_dim != self.decoder_hidden_dim:
                 raise ValueError("Luong dot attention requires equal encoder and decoder hidden dimensions")

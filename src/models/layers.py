@@ -47,21 +47,17 @@ class VanillaRNN(nn.Module):
         super().__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size
-
-        self.W_xh = nn.Parameter(torch.randn(hidden_size, input_size) * 0.01)
+        self.W_xh = nn.Parameter(torch.randn(input_size, hidden_size) * 0.01)
         self.W_hh = nn.Parameter(torch.randn(hidden_size, hidden_size) * 0.01)
-        self.b_h = nn.Parameter(torch.zeros(hidden_size, 1))
+        self.b_h = nn.Parameter(torch.zeros(hidden_size))
 
-    def init_hidden(self, device=None):
-        if device is None:
-            device = self.W_xh.device
-        return torch.zeros((self.hidden_size, 1), device=device)
+    def init_hidden(self, batch_size, device=None):
+        if device is None: device = self.W_xh.device
+        return torch.zeros(batch_size, self.hidden_size, device=device)
 
     def step(self, x_t, h_prev):
-        x_t = x_t.view(-1, 1).to(self.W_xh.device)
-        h_prev = h_prev.to(self.W_xh.device)
-
-        h_t = tanh(self.W_xh @ x_t + self.W_hh @ h_prev + self.b_h)
+        # x_t: [batch, input_size], h_prev: [batch, hidden_size]
+        h_t = torch.tanh(x_t @ self.W_xh + h_prev @ self.W_hh + self.b_h)
         return h_t
 
     def forward(self, inputs, init_state=None):
@@ -110,45 +106,34 @@ class LSTM(nn.Module):
         super().__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size
-        concat_size = hidden_size + input_size
+        # Khởi tạo trọng số gộp để tính toán nhanh hơn
+        self.W_all = nn.Parameter(torch.randn(input_size + hidden_size, 4 * hidden_size) * 0.01)
+        self.b_all = nn.Parameter(torch.zeros(4 * hidden_size))
 
-        self.W_f = nn.Parameter(torch.randn(hidden_size, concat_size) * 0.01)
-        self.b_f = nn.Parameter(torch.zeros(hidden_size, 1))
+    def init_hidden(self, batch_size, device=None):
+        if device is None: device = self.W_all.device
+        h = torch.zeros(batch_size, self.hidden_size, device=device)
+        c = torch.zeros(batch_size, self.hidden_size, device=device)
+        return (h, c)
 
-        self.W_i = nn.Parameter(torch.randn(hidden_size, concat_size) * 0.01)
-        self.b_i = nn.Parameter(torch.zeros(hidden_size, 1))
-
-        self.W_c = nn.Parameter(torch.randn(hidden_size, concat_size) * 0.01)
-        self.b_c = nn.Parameter(torch.zeros(hidden_size, 1))
-
-        self.W_o = nn.Parameter(torch.randn(hidden_size, concat_size) * 0.01)
-        self.b_o = nn.Parameter(torch.zeros(hidden_size, 1))
-
-    def init_hidden(self, device=None):
-        if device is None:
-            device = self.W_f.device
-
-        h0 = torch.zeros((self.hidden_size, 1), device=device)
-        c0 = torch.zeros((self.hidden_size, 1), device=device)
-        return (h0, c0)
-
-    def step(self, x_t, prev_state):
-        x_t = x_t.view(-1, 1).to(self.W_f.device)
-        h_prev, c_prev = prev_state
-        h_prev = h_prev.to(self.W_f.device)
-        c_prev = c_prev.to(self.W_f.device)
-
-        concat = torch.cat((h_prev, x_t), dim=0)
-
-        f_t = sigmoid(self.W_f @ concat + self.b_f)
-        i_t = sigmoid(self.W_i @ concat + self.b_i)
-        c_tilde = tanh(self.W_c @ concat + self.b_c)
-        c_t = f_t * c_prev + i_t * c_tilde
-
-        o_t = sigmoid(self.W_o @ concat + self.b_o)
-        h_t = o_t * tanh(c_t)
-
-        return (h_t, c_t)
+    def step(self, x_t, h_prev, c_prev=None):
+        # Xử lý trường hợp truyền tuple (từ Encoder) hoặc truyền rời (từ Decoder)
+        if c_prev is None and isinstance(h_prev, tuple):
+            h_prev, c_prev = h_prev
+            
+        concat = torch.cat((x_t, h_prev), dim=1) # [batch, input + hidden]
+        gates = concat @ self.W_all + self.b_all # [batch, 4 * hidden]
+        
+        i_t, f_t, g_t, o_t = gates.chunk(4, dim=1)
+        
+        i_t = torch.sigmoid(i_t)
+        f_t = torch.sigmoid(f_t)
+        g_t = torch.tanh(g_t)
+        o_t = torch.sigmoid(o_t)
+        
+        c_t = f_t * c_prev + i_t * g_t
+        h_t = o_t * torch.tanh(c_t)
+        return h_t, c_t
 
     def forward(self, inputs, init_state=None):
         if isinstance(inputs, torch.Tensor):
@@ -189,18 +174,19 @@ class GRU(nn.Module):
         concat_size = hidden_size + input_size
 
         self.W_z = nn.Parameter(torch.randn(hidden_size, concat_size) * 0.01)
-        self.b_z = nn.Parameter(torch.zeros(hidden_size, 1))
+        self.b_z = nn.Parameter(torch.zeros(hidden_size))
 
         self.W_r = nn.Parameter(torch.randn(hidden_size, concat_size) * 0.01)
-        self.b_r = nn.Parameter(torch.zeros(hidden_size, 1))
+        self.b_r = nn.Parameter(torch.zeros(hidden_size))
 
         self.W_h = nn.Parameter(torch.randn(hidden_size, concat_size) * 0.01)
-        self.b_h = nn.Parameter(torch.zeros(hidden_size, 1))
+        self.b_h = nn.Parameter(torch.zeros(hidden_size))
 
-    def init_hidden(self, device=None):
+    def init_hidden(self, batch_size, device=None): # Thêm batch_size
         if device is None:
             device = self.W_z.device
-        return torch.zeros((self.hidden_size, 1), device=device)
+        # Khởi tạo shape [batch_size, hidden_size]
+        return torch.zeros((batch_size, self.hidden_size), device=device)
 
     def step(self, x_t, h_prev):
         x_t = x_t.to(self.W_z.device)
@@ -213,11 +199,11 @@ class GRU(nn.Module):
 
         concat = torch.cat((h_prev, x_t), dim=1)
 
-        z_t = sigmoid(concat @ self.W_z.T + self.b_z.T)
-        r_t = sigmoid(concat @ self.W_r.T + self.b_r.T)
+        z_t = sigmoid(concat @ self.W_z.T + self.b_z)
+        r_t = sigmoid(concat @ self.W_r.T + self.b_r)
 
         concat_reset = torch.cat((r_t * h_prev, x_t), dim=1)
-        h_tilde = tanh(concat_reset @ self.W_h.T + self.b_h.T)
+        h_tilde = tanh(concat_reset @ self.W_h.T + self.b_h)
 
         h_t = (1 - z_t) * h_prev + z_t * h_tilde
         return h_t

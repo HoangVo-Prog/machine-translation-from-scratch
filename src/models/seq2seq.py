@@ -85,13 +85,15 @@ class Seq2Seq(nn.Module):
             dtype=torch.long,
             device=src.device,
         )
-        return self.forward(
+        logits, _ = self.forward(
             src=src,
             tgt=start_tokens,
             src_lengths=src_lengths,
             teacher_forcing_ratio=0.0,
             max_length=max_length,
         )
+        # Return the predicted tokens (argmax of logits)
+        return logits.argmax(dim=-1)
 
 
 __all__ = ["Seq2Seq"]

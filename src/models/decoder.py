@@ -170,7 +170,7 @@ class Decoder(nn.Module):
             if use_teacher_forcing:
                 current_token = tgt[:, t + 1]
             else:
-                current_token = logits.argmax(dim=-1)
+                current_token = logits.argmax(dim=-1).detach()
 
             # Quan trọng:
             # Không early-stop khi training, vì sẽ làm logits ngắn hơn labels.

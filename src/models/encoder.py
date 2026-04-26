@@ -79,21 +79,14 @@ class Encoder(nn.Module):
 
 
     def _init_hidden(self, batch_size: int, device: torch.device):
-        """
-        Khởi tạo hidden state bằng zeros cho mỗi layer.
-
-        Returns
-        -------
-        list of (h_0,) hoặc (h_0, c_0) tùy cell_type
-        """
         states = []
-        for _ in range(self.num_layers):
-            h = torch.zeros(batch_size, self.hidden_size, device=device)
-            if self.cell_type == "lstm":
-                c = torch.zeros(batch_size, self.hidden_size, device=device)
-                states.append((h, c))
-            else:
-                states.append((h,))   # tuple 1 phần tử cho đồng nhất interface
+        for i in range(self.num_layers):
+            # Gọi trực tiếp hàm init_hidden của cell tương ứng
+            layer_state = self.cells[i].init_hidden(batch_size, device)
+            # Đảm bảo trả về dạng tuple để nhất quán
+            if not isinstance(layer_state, tuple):
+                layer_state = (layer_state,)
+            states.append(layer_state)
         return states
 
 
