@@ -268,8 +268,13 @@ def evaluate_model(
                         max_length=max_length,
                     )
 
-                    logits = outputs[0] if isinstance(outputs, (tuple, list)) else outputs
-                    pred_tokens = logits.argmax(dim=-1)
+                    if isinstance(outputs, (tuple, list)):
+                        logits = outputs[0]
+                        pred_tokens = logits.argmax(dim=-1)
+                    elif torch.is_tensor(outputs):
+                        pred_tokens = outputs
+                    else:
+                        raise ValueError("greedy_decode returned unsupported type for evaluation.")
 
                 else:
                     outputs = model(inputs, labels)

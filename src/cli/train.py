@@ -116,7 +116,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wandb_project", type=str, default=None)
     parser.add_argument("--wandb_entity", type=str, default=None)
     parser.add_argument("--wandb_run_name", type=str, default=None)
+    parser.add_argument("--wandb_id", type=str, default=None)
+    parser.add_argument("--wandb_resume", type=str, default=None)
     parser.add_argument("--wandb_log_steps", type=int, default=None)
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--max_len", type=float, default=0.95)
     parser.add_argument("--dropout", type=float, default=None)
@@ -141,7 +144,7 @@ def _merge_cli_flags_into_config(args, config):
         "label_smoothing", "warmup_steps", "warmup_ratio",
         "scheduler_type", "max_grad_norm", "eval_steps",
         "save_steps", "logging_steps", "metric_for_best_model",
-        "wandb_mode", "wandb_project", "wandb_entity", "wandb_run_name", "wandb_log_steps",
+        "resume_from_checkpoint", "wandb_mode", "wandb_project", "wandb_entity", "wandb_run_name", "wandb_id", "wandb_resume", "wandb_log_steps",
         "dropout", "optimizer_type", "early_stopping_patience", "min_lr",
         "generation_temperature", "generation_top_k", "generation_top_p", "generation_repetition_penalty",
     ]
@@ -151,7 +154,7 @@ def _merge_cli_flags_into_config(args, config):
         if value is not None:
             merged[key] = value
 
-    for key in ("mixed_precision", "greater_is_better", "wandb_enabled"):
+    for key in ("mixed_precision", "greater_is_better", "wandb_enabled", "wandb_resume"):
         raw = getattr(args, key)
         parsed = _read_bool_like(raw) if raw is not None else None
         if parsed is not None:

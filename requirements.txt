@@ -17,3 +17,4 @@ isort
 sacrebleu
 rouge-score
 python-dotenv
+wandb
