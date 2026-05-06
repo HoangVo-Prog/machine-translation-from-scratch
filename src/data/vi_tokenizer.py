@@ -141,3 +141,7 @@ class VietnameseTokenizer:
                 tokens.append(token_str)
 
         return tokens[:max_len] if max_len else tokens
+
+def tokenize_vi(text, max_len=None, tokenizer_type="bpe"):
+    tokenizer = VietnameseTokenizer(tokenizer_type=tokenizer_type)
+    return tokenizer.encode(text, max_len=max_len)

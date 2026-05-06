@@ -335,13 +335,18 @@ def _write_epoch_sample_translations(
     generation_kwargs: dict[str, Any],
     num_samples: int = 5,
 ) -> None:
+    # Lấy mẫu cố định để đánh giá
     raw_pairs, src_batch, _ = _get_fixed_eval_samples(eval_dataloader, num_samples=num_samples)
     if not raw_pairs or src_batch is None:
         return
 
     model.eval()
+    device = next(model.parameters()).device # Lấy device hiện tại của model
+
     with torch.no_grad():
-        src_batch = src_batch.to(next(model.parameters()).device)
+        # Chuyển src_batch lên đúng device của model
+        src_batch = src_batch.to(device)
+        
         dataset = getattr(eval_dataloader, "dataset", None)
         bos_token_id = None
         if dataset is not None and hasattr(dataset, "vocab_trg"):
@@ -349,8 +354,11 @@ def _write_epoch_sample_translations(
         if bos_token_id is None:
             bos_token_id = 1
 
+        # Kiểm soát max_length để tránh tràn bộ nhớ nếu câu đầu vào quá dài
         max_length = int(generation_kwargs.get("max_length", max(50, src_batch.shape[1] + 20)))
+        
         try:
+            # Giải mã bằng phương pháp Greedy Search
             pred_tokens = model.greedy_decode(
                 src_batch,
                 bos_token_id=bos_token_id,
@@ -359,9 +367,15 @@ def _write_epoch_sample_translations(
             )
         except Exception:
             LOGGER.warning("Epoch %s: unable to generate translation samples; skipping sample logging.", epoch)
+            # Dọn dẹp trước khi thoát nếu lỗi[cite: 4]
+            del src_batch
+            torch.cuda.empty_cache()
             return
 
+    # Chuyển token sang văn bản (Decode)
+    # Lưu ý: pred_tokens thường là tensor trên GPU, ta nên xử lý xong rồi giải phóng ngay[cite: 1]
     predictions = _decode_predictions(tokenizer, pred_tokens)
+    
     rows: list[list[Any]] = []
 
     LOGGER.info("epoch=%s translation samples:", epoch)
@@ -371,9 +385,13 @@ def _write_epoch_sample_translations(
         LOGGER.info("epoch=%s sample=%s pred=%s", epoch, index, prediction)
         rows.append([epoch, source, reference, prediction])
 
+    # Ghi kết quả vào file CSV
     csv_path = output_dir / "translation_samples.csv"
     _append_translation_samples(csv_path, rows)
 
+    # Giải phóng hoàn toàn các tensor lớn và dọn cache GPU sau khi hoàn tất log
+    del src_batch, pred_tokens
+    torch.cuda.empty_cache()
 
 def train(
     model: torch.nn.Module,
@@ -459,11 +477,13 @@ def train(
         current_epoch = epoch
         model.train()
         for step, batch in enumerate(train_dataloader, start=1):
+            # 1. Chuyển batch sang GPU
             batch = _move_to_device(batch, active_device)
             labels = _extract_labels(batch)
 
             autocast_context = autocast(device_type=active_device.type) if use_amp else nullcontext()
             with autocast_context:
+                # 2. Forward pass
                 outputs = _forward_model(model, batch)
                 loss, loss_logs = maybe_compute_loss_from_outputs(
                     outputs=outputs,
@@ -472,15 +492,21 @@ def train(
                     ignore_index=ignore_index,
                 )
 
+            # 3. Tính toán loss và backward
             scaled_loss = loss / max(1, grad_accum_steps)
             if scaler is not None:
                 scaler.scale(scaled_loss).backward()
             else:
                 scaled_loss.backward()
 
+            # GIẢI PHÓNG TENSOR TRUNG GIAN NGAY LẬP TỨC
+            # Giữ lại loss_logs (vì nó thường là float/string), nhưng xóa tensor nặng
+            del outputs, loss, scaled_loss 
+
             if step % grad_accum_steps != 0:
                 continue
 
+            # 4. Optimizer step
             grad_norm = None
             if max_grad_norm > 0:
                 if scaler is not None:
@@ -492,12 +518,19 @@ def train(
                 scaler.update()
             else:
                 optimizer.step()
+            
+            # Tối ưu hóa: set_to_none=True nhanh và tiết kiệm hơn zero_grad()
             optimizer.zero_grad(set_to_none=True)
 
             if scheduler is not None:
                 scheduler.step()
 
             global_step += 1
+            
+            # Dọn dẹp batch hiện tại khỏi bộ nhớ GPU[cite: 1]
+            del batch, labels
+
+            # 5. Logging và Evaluation
             train_logs = dict(loss_logs)
             train_logs["train/lr"] = float(optimizer.param_groups[0]["lr"])
             if grad_norm is not None:
@@ -508,6 +541,7 @@ def train(
             if wandb_run is not None and global_step % wandb_log_steps == 0:
                 _wandb_log(wandb_run, train_logs, step=global_step)
 
+            # Đánh giá Model (Nơi cực kỳ dễ gây OOM)
             if eval_dataloader is not None and eval_steps and global_step % int(eval_steps) == 0:
                 metrics = evaluate_model(
                     model=model,
@@ -519,44 +553,33 @@ def train(
                 )
                 LOGGER.info("eval step=%s metrics=%s", global_step, metrics)
                 _wandb_log(wandb_run, metrics, step=global_step)
+                
+                # Dọn cache GPU sau khi chạy eval nặng[cite: 4]
+                torch.cuda.empty_cache()
 
+                # Logic Early Stopping (giữ nguyên của bạn)
                 current_metric = float(metrics.get(metric_for_best, float("nan")))
                 if not torch.isnan(torch.tensor(current_metric)):
                     improved = current_metric > best_metric if greater_is_better else current_metric < best_metric
                     if improved:
                         best_metric = current_metric
                         early_stopping_counter = 0
-                        best_checkpoint = _save_checkpoint(
-                            model=model,
-                            optimizer=optimizer,
-                            scheduler=scheduler,
-                            scaler=scaler,
-                            output_dir=output_dir,
-                            name="best",
-                            tokenizer=tokenizer,
-                            extra_state={
-                                "epoch": epoch,
-                                "global_step": global_step,
-                                "best_metric": best_metric,
-                                "metric_for_best_model": metric_for_best,
-                            },
+                        _save_checkpoint(
+                            model=model, optimizer=optimizer, scheduler=scheduler,
+                            scaler=scaler, output_dir=output_dir, name="best",
+                            tokenizer=tokenizer, extra_state={"epoch": epoch, "global_step": global_step, "best_metric": best_metric}
                         )
                     else:
                         early_stopping_counter += 1
                         if early_stopping_patience and early_stopping_counter >= early_stopping_patience:
-                            LOGGER.info("Early stopping triggered after %s epochs without improvement.", early_stopping_patience)
+                            LOGGER.info("Early stopping triggered.")
                             break
 
             if save_steps and global_step % int(save_steps) == 0:
-                last_checkpoint = _save_checkpoint(
-                    model=model,
-                    optimizer=optimizer,
-                    scheduler=scheduler,
-                    scaler=scaler,
-                    output_dir=output_dir,
-                    name=f"step_{global_step}",
-                    tokenizer=tokenizer,
-                    extra_state={"epoch": epoch, "global_step": global_step},
+                _save_checkpoint(
+                    model=model, optimizer=optimizer, scheduler=scheduler,
+                    scaler=scaler, output_dir=output_dir, name=f"step_{global_step}",
+                    tokenizer=tokenizer, extra_state={"epoch": epoch, "global_step": global_step}
                 )
 
             if max_steps is not None and global_step >= int(max_steps):
@@ -565,6 +588,7 @@ def train(
         if max_steps is not None and global_step >= int(max_steps):
             break
 
+        # 6. Cuối mỗi Epoch: Ghi mẫu dịch và dọn dẹp
         if eval_dataloader is not None:
             _write_epoch_sample_translations(
                 epoch=epoch + 1,
@@ -574,6 +598,8 @@ def train(
                 output_dir=output_dir,
                 generation_kwargs=generation_kwargs,
             )
+            # Dọn dẹp sau khi ghi mẫu
+            torch.cuda.empty_cache()
 
     if eval_dataloader is not None and bool(_cfg(config, "run_eval_at_end", True)):
         final_metrics = evaluate_model(

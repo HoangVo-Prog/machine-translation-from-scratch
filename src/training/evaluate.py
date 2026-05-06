@@ -5,7 +5,8 @@ from __future__ import annotations
 import logging
 import unicodedata
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import Any, Mapping
+import torch
 
 import torch
 
@@ -223,6 +224,7 @@ def evaluate_model(
 
     with torch.no_grad():
         for batch in eval_dataloader:
+            # Chuyển batch sang device (GPU/CPU)
             batch = _move_to_device(batch, active_device)
 
             if isinstance(batch, Mapping):
@@ -231,6 +233,7 @@ def evaluate_model(
                     if key in batch:
                         labels = batch[key]
                         break
+                
                 if hasattr(model, "generate"):
                     gen_inputs = {
                         k: v
@@ -243,23 +246,30 @@ def evaluate_model(
                         outputs = model(**batch)
                         logits = outputs.logits if hasattr(outputs, "logits") else outputs["logits"]
                         pred_tokens = logits.argmax(dim=-1)
+                        del outputs # Giải phóng bộ nhớ tensor trung gian
                 else:
                     outputs = model(**batch)
                     logits = outputs.logits if hasattr(outputs, "logits") else outputs["logits"]
                     pred_tokens = logits.argmax(dim=-1)
+                    del outputs # Giải phóng bộ nhớ tensor trung gian
 
-                predictions.extend(_decode_token_batch(tokenizer, pred_tokens, ignore_index))
+                # Decode và lưu kết quả dưới dạng text để giải phóng RAM/VRAM[cite: 1]
+                decoded_preds = _decode_token_batch(tokenizer, pred_tokens, ignore_index)
+                predictions.extend(decoded_preds)
+                
                 if labels is not None:
                     references.extend(_decode_token_batch(tokenizer, labels, ignore_index))
                 elif "references" in batch:
                     references.extend(_to_list(batch["references"]))
                 else:
-                    references.extend([""] * len(_decode_token_batch(tokenizer, pred_tokens, ignore_index)))
+                    references.extend([""] * len(decoded_preds))
+
             elif isinstance(batch, (tuple, list)) and len(batch) >= 2:
                 inputs, labels = batch[0], batch[1]
 
                 if hasattr(model, "greedy_decode") and torch.is_tensor(inputs):
                     bos_token_id = generation_kwargs.get("bos_token_id", 1)
+                    # Giới hạn max_length để tránh tràn bộ nhớ khi câu đầu vào quá dài
                     max_length = generation_kwargs.get("max_length", labels.size(1))
 
                     outputs = model.greedy_decode(
@@ -278,7 +288,6 @@ def evaluate_model(
 
                 else:
                     outputs = model(inputs, labels)
-
                     if isinstance(outputs, (tuple, list)):
                         logits = outputs[0]
                     elif hasattr(outputs, "logits"):
@@ -287,13 +296,21 @@ def evaluate_model(
                         logits = outputs["logits"]
                     else:
                         logits = outputs
-
                     pred_tokens = logits.argmax(dim=-1)
 
+                # Decode ngay lập tức sang string[cite: 1]
                 predictions.extend(_decode_token_batch(tokenizer, pred_tokens, ignore_index))
                 references.extend(_decode_token_batch(tokenizer, labels[:, 1:], ignore_index))
+                
+                # Giải phóng tensor trung gian sau mỗi batch[cite: 1, 4]
+                if 'outputs' in locals(): del outputs
             else:
                 raise ValueError("Unsupported batch format for evaluation.")
 
+            # Dọn dẹp bộ nhớ đệm của GPU sau mỗi batch để tránh tích tụ[cite: 4]
+            del pred_tokens, batch
+            torch.cuda.empty_cache()
+
+    # Tính toán metrics cuối cùng dựa trên danh sách string đã lưu
     return compute_mt_metrics(predictions, references)
 
