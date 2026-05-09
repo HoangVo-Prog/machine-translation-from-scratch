@@ -27,6 +27,9 @@ except ImportError:  # pragma: no cover - fallback for direct script execution
 LOGGER = logging.getLogger(__name__)
 _DEPENDENCY_INSTALL_HINT = "pip install sacrebleu rouge-score wandb python-dotenv"
 _DOTENV_LOADED = False
+_LABEL_KEYS = ("labels", "target_ids", "targets", "y")
+_REFERENCE_KEYS = ("references", "refs")
+_NON_MODEL_INPUT_KEYS = set(_LABEL_KEYS) | set(_REFERENCE_KEYS)
 
 
 def get_secret(name: str, default: Any = None) -> Any:
@@ -100,7 +103,7 @@ def _move_to_device(batch: Any, device: torch.device) -> Any:
 
 def _extract_labels(batch: Any) -> torch.Tensor | None:
     if isinstance(batch, Mapping):
-        for key in ("labels", "target_ids", "targets", "y"):
+        for key in _LABEL_KEYS:
             value = batch.get(key)
             if torch.is_tensor(value):
                 return value
@@ -112,11 +115,15 @@ def _extract_labels(batch: Any) -> torch.Tensor | None:
 
 def _forward_model(model: torch.nn.Module, batch: Any) -> Any:
     if isinstance(batch, Mapping):
-        return model(**batch)
+        model_inputs = {k: v for k, v in batch.items() if k not in _NON_MODEL_INPUT_KEYS}
+        return model(**model_inputs)
     if isinstance(batch, (tuple, list)):
+        # Dataset trả về (src, tgt, src_mask, tgt_mask) — chỉ cần src và tgt
         if len(batch) >= 2 and torch.is_tensor(batch[0]) and torch.is_tensor(batch[1]):
-            return model(batch[0], batch[1])
-        return model(*batch)
+            return model(batch[0], batch[1])  # ← chỉ truyền src, tgt
+        if len(batch) == 1:
+            return model(batch[0])
+        raise ValueError(f"Unsupported batch format: {type(batch)}")
     return model(batch)
 
 
@@ -215,10 +222,11 @@ def _save_checkpoint(
     checkpoint_dir = output_dir / name
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+    model_format = "state_dict"
     if hasattr(model, "save_pretrained"):
         model.save_pretrained(str(checkpoint_dir))
-    else:
-        torch.save(model.state_dict(), checkpoint_dir / "model.pt")
+        model_format = "pretrained"
+    torch.save(model.state_dict(), checkpoint_dir / "model.pt")
 
     if tokenizer is not None and hasattr(tokenizer, "save_pretrained"):
         tokenizer.save_pretrained(str(checkpoint_dir))
@@ -227,6 +235,7 @@ def _save_checkpoint(
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict() if scheduler is not None else None,
         "scaler": scaler.state_dict() if scaler is not None else None,
+        "model_format": model_format,
     }
     if extra_state:
         state.update(extra_state)
@@ -244,14 +253,21 @@ def _load_checkpoint(
     if not checkpoint_dir.exists():
         raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir}")
 
-    model_path = checkpoint_dir / "model.pt"
-    if not model_path.exists():
-        raise FileNotFoundError(f"Model checkpoint not found: {model_path}")
-
-    state_dict = torch.load(model_path, map_location="cpu")
-    model.load_state_dict(state_dict)
-
     training_state = torch.load(checkpoint_dir / "training_state.pt", map_location="cpu")
+    model_path = checkpoint_dir / "model.pt"
+    model_format = training_state.get("model_format")
+
+    if model_path.exists():
+        state_dict = torch.load(model_path, map_location="cpu")
+        model.load_state_dict(state_dict)
+    elif model_format == "pretrained" and hasattr(model.__class__, "from_pretrained"):
+        restored_model = model.__class__.from_pretrained(str(checkpoint_dir))
+        model.load_state_dict(restored_model.state_dict())
+    else:
+        raise FileNotFoundError(
+            f"Model checkpoint not found in {checkpoint_dir}. "
+            "Expected model.pt or compatible pretrained weights."
+        )
     optimizer.load_state_dict(training_state["optimizer"])
 
     if scheduler is not None and training_state.get("scheduler") is not None:
@@ -335,13 +351,18 @@ def _write_epoch_sample_translations(
     generation_kwargs: dict[str, Any],
     num_samples: int = 5,
 ) -> None:
+    # Lấy mẫu cố định để đánh giá
     raw_pairs, src_batch, _ = _get_fixed_eval_samples(eval_dataloader, num_samples=num_samples)
     if not raw_pairs or src_batch is None:
         return
 
     model.eval()
+    device = next(model.parameters()).device # Lấy device hiện tại của model
+
     with torch.no_grad():
-        src_batch = src_batch.to(next(model.parameters()).device)
+        # Chuyển src_batch lên đúng device của model
+        src_batch = src_batch.to(device)
+        
         dataset = getattr(eval_dataloader, "dataset", None)
         bos_token_id = None
         if dataset is not None and hasattr(dataset, "vocab_trg"):
@@ -349,8 +370,11 @@ def _write_epoch_sample_translations(
         if bos_token_id is None:
             bos_token_id = 1
 
+        # Kiểm soát max_length để tránh tràn bộ nhớ nếu câu đầu vào quá dài
         max_length = int(generation_kwargs.get("max_length", max(50, src_batch.shape[1] + 20)))
+        
         try:
+            # Giải mã bằng phương pháp Greedy Search
             pred_tokens = model.greedy_decode(
                 src_batch,
                 bos_token_id=bos_token_id,
@@ -359,9 +383,15 @@ def _write_epoch_sample_translations(
             )
         except Exception:
             LOGGER.warning("Epoch %s: unable to generate translation samples; skipping sample logging.", epoch)
+            # Dọn dẹp trước khi thoát nếu lỗi[cite: 4]
+            del src_batch
+            torch.cuda.empty_cache()
             return
 
+    # Chuyển token sang văn bản (Decode)
+    # Lưu ý: pred_tokens thường là tensor trên GPU, ta nên xử lý xong rồi giải phóng ngay[cite: 1]
     predictions = _decode_predictions(tokenizer, pred_tokens)
+    
     rows: list[list[Any]] = []
 
     LOGGER.info("epoch=%s translation samples:", epoch)
@@ -371,9 +401,13 @@ def _write_epoch_sample_translations(
         LOGGER.info("epoch=%s sample=%s pred=%s", epoch, index, prediction)
         rows.append([epoch, source, reference, prediction])
 
+    # Ghi kết quả vào file CSV
     csv_path = output_dir / "translation_samples.csv"
     _append_translation_samples(csv_path, rows)
 
+    # Giải phóng hoàn toàn các tensor lớn và dọn cache GPU sau khi hoàn tất log
+    del src_batch, pred_tokens
+    torch.cuda.empty_cache()
 
 def train(
     model: torch.nn.Module,
@@ -383,7 +417,9 @@ def train(
     tokenizer: Any | None = None,
     device: torch.device | str | None = None,
 ) -> dict[str, Any]:
-    """Train a MT model with periodic evaluation and checkpointing."""
+    """Huấn luyện mô hình MT với các tính năng: Eval định kỳ, Checkpoint, AMP và Early Stopping."""
+    
+    # --- 1. CẤU HÌNH BAN ĐẦU ---
     config = config or {}
     output_dir = Path(_cfg(config, "output_dir", "checkpoints"))
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -393,6 +429,7 @@ def train(
     )
     model = model.to(active_device)
 
+    # Đọc các tham số từ config
     num_epochs = int(_cfg(config, "num_epochs", _cfg(config, "epochs", 1)))
     max_steps = _cfg(config, "max_steps", None)
     grad_accum_steps = int(_cfg(config, "gradient_accumulation_steps", 1))
@@ -404,23 +441,10 @@ def train(
     max_grad_norm = float(_cfg(config, "max_grad_norm", 1.0))
     metric_for_best = str(_cfg(config, "metric_for_best_model", "eval/bleu"))
     greater_is_better = bool(_cfg(config, "greater_is_better", True))
-    generation_kwargs = copy.deepcopy(_cfg(config, "generation_kwargs", {}))
-    wandb_log_steps = int(_cfg(config, "wandb_log_steps", 100))
-    dropout = float(_cfg(config, "dropout", 0.1))
-    optimizer_type = str(_cfg(config, "optimizer_type", "adamw"))
     early_stopping_patience = _cfg(config, "early_stopping_patience", None)
-    min_lr = float(_cfg(config, "min_lr", 1e-6))
+    generation_kwargs = copy.deepcopy(_cfg(config, "generation_kwargs", {}))
 
-    # Merge generation kwargs from CLI
-    if _cfg(config, "generation_temperature", None) is not None:
-        generation_kwargs["temperature"] = float(_cfg(config, "generation_temperature"))
-    if _cfg(config, "generation_top_k", None) is not None:
-        generation_kwargs["top_k"] = int(_cfg(config, "generation_top_k"))
-    if _cfg(config, "generation_top_p", None) is not None:
-        generation_kwargs["top_p"] = float(_cfg(config, "generation_top_p"))
-    if _cfg(config, "generation_repetition_penalty", None) is not None:
-        generation_kwargs["repetition_penalty"] = float(_cfg(config, "generation_repetition_penalty"))
-
+    # --- 2. OPTIMIZER, SCHEDULER & AMP ---
     total_steps = _compute_total_training_steps(train_dataloader, num_epochs, grad_accum_steps, max_steps)
     optimizer = build_optimizer(model, config)
     scheduler = build_scheduler(optimizer, config, total_steps)
@@ -428,98 +452,100 @@ def train(
     use_amp = bool(_cfg(config, "mixed_precision", False)) and active_device.type == "cuda"
     scaler = GradScaler() if use_amp else None
 
-    resume_checkpoint = _cfg(config, "resume_from_checkpoint", None)
+    # --- 3. RESUME CHECKPOINT ---
     start_epoch = 0
-    best_metric = float("-inf") if greater_is_better else float("inf")
     global_step = 0
+    best_metric = float("-inf") if greater_is_better else float("inf")
+    resume_checkpoint = _cfg(config, "resume_from_checkpoint", None)
+    
     if resume_checkpoint is not None:
-        checkpoint_path = Path(resume_checkpoint)
-        resume_state = _load_checkpoint(
-            checkpoint_dir=checkpoint_path,
-            model=model,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            scaler=scaler,
-        )
+        resume_state = _load_checkpoint(Path(resume_checkpoint), model, optimizer, scheduler, scaler)
         start_epoch = min(resume_state.get("epoch", 0) + 1, num_epochs)
         global_step = resume_state.get("global_step", 0)
-        if resume_state.get("best_metric") is not None:
-            best_metric = float(resume_state["best_metric"])
+        best_metric = float(resume_state.get("best_metric", best_metric))
 
     wandb_run = _init_wandb(config, output_dir)
-
-    best_checkpoint: str | None = None
-    last_checkpoint: str | None = None
+    best_checkpoint = None
     early_stopping_counter = 0
+    should_stop = False  # Cờ để dừng toàn bộ training
     current_epoch = start_epoch
 
     optimizer.zero_grad(set_to_none=True)
 
+    # --- 4. VÒNG LẶP HUẤN LUYỆN CHÍNH ---
     for epoch in range(start_epoch, num_epochs):
+        if should_stop:
+            break
+            
         current_epoch = epoch
         model.train()
+        
         for step, batch in enumerate(train_dataloader, start=1):
+            # Di chuyển dữ liệu lên GPU
             batch = _move_to_device(batch, active_device)
             labels = _extract_labels(batch)
 
+            # Forward pass với Mixed Precision
             autocast_context = autocast(device_type=active_device.type) if use_amp else nullcontext()
             with autocast_context:
                 outputs = _forward_model(model, batch)
                 loss, loss_logs = maybe_compute_loss_from_outputs(
-                    outputs=outputs,
-                    labels=labels,
-                    label_smoothing=label_smoothing,
-                    ignore_index=ignore_index,
+                    outputs=outputs, labels=labels,
+                    label_smoothing=label_smoothing, ignore_index=ignore_index,
                 )
 
+            # Backward pass
             scaled_loss = loss / max(1, grad_accum_steps)
             if scaler is not None:
                 scaler.scale(scaled_loss).backward()
             else:
                 scaled_loss.backward()
 
+            # Giải phóng tensor trung gian ngay lập tức để tránh OOM
+            del outputs, loss, scaled_loss 
+
             if step % grad_accum_steps != 0:
                 continue
 
-            grad_norm = None
+            # Optimizer Step (Gradient Clipping & Update)
             if max_grad_norm > 0:
-                if scaler is not None:
-                    scaler.unscale_(optimizer)
-                grad_norm = float(clip_grad_norm_(model.parameters(), max_grad_norm))
+                if scaler is not None: scaler.unscale_(optimizer)
+                clip_grad_norm_(model.parameters(), max_grad_norm)
 
             if scaler is not None:
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 optimizer.step()
+            
+            # Xóa gradient nhanh (set_to_none=True)
             optimizer.zero_grad(set_to_none=True)
-
             if scheduler is not None:
                 scheduler.step()
 
             global_step += 1
-            train_logs = dict(loss_logs)
-            train_logs["train/lr"] = float(optimizer.param_groups[0]["lr"])
-            if grad_norm is not None:
-                train_logs["train/grad_norm"] = grad_norm
+            del batch, labels # Xóa dữ liệu batch sau khi xong
 
+            # Logging & Eval
+            train_logs = {**loss_logs, "train/lr": float(optimizer.param_groups[0]["lr"])}
             if global_step % logging_steps == 0:
-                LOGGER.info("step=%s %s", global_step, train_logs)
-            if wandb_run is not None and global_step % wandb_log_steps == 0:
+                LOGGER.info(f"Step {global_step} | Loss: {loss_logs.get('train/loss_total', 0):.4f}")
+            if wandb_run and global_step % _cfg(config, "wandb_log_steps", 100) == 0:
                 _wandb_log(wandb_run, train_logs, step=global_step)
 
+            # --- ĐÁNH GIÁ (EVALUATION) ---
             if eval_dataloader is not None and eval_steps and global_step % int(eval_steps) == 0:
                 metrics = evaluate_model(
-                    model=model,
-                    eval_dataloader=eval_dataloader,
-                    tokenizer=tokenizer,
-                    device=active_device,
-                    generation_kwargs=generation_kwargs,
-                    ignore_index=ignore_index,
+                    model=model, eval_dataloader=eval_dataloader, tokenizer=tokenizer,
+                    device=active_device, generation_kwargs=generation_kwargs, ignore_index=ignore_index,
                 )
-                LOGGER.info("eval step=%s metrics=%s", global_step, metrics)
                 _wandb_log(wandb_run, metrics, step=global_step)
+                
+                # Quan trọng: Dọn dẹp cache sau Eval nặng
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
+                # Kiểm tra Early Stopping
                 current_metric = float(metrics.get(metric_for_best, float("nan")))
                 if not torch.isnan(torch.tensor(current_metric)):
                     improved = current_metric > best_metric if greater_is_better else current_metric < best_metric
@@ -527,87 +553,52 @@ def train(
                         best_metric = current_metric
                         early_stopping_counter = 0
                         best_checkpoint = _save_checkpoint(
-                            model=model,
-                            optimizer=optimizer,
-                            scheduler=scheduler,
-                            scaler=scaler,
-                            output_dir=output_dir,
-                            name="best",
-                            tokenizer=tokenizer,
-                            extra_state={
-                                "epoch": epoch,
-                                "global_step": global_step,
-                                "best_metric": best_metric,
-                                "metric_for_best_model": metric_for_best,
-                            },
+                            model=model, optimizer=optimizer, scheduler=scheduler,
+                            scaler=scaler, output_dir=output_dir, name="best",
+                            tokenizer=tokenizer, extra_state={"epoch": epoch, "global_step": global_step, "best_metric": best_metric}
                         )
                     else:
                         early_stopping_counter += 1
                         if early_stopping_patience and early_stopping_counter >= early_stopping_patience:
-                            LOGGER.info("Early stopping triggered after %s epochs without improvement.", early_stopping_patience)
+                            LOGGER.info("Early stopping triggered!")
+                            should_stop = True
                             break
 
+            # Lưu checkpoint định kỳ
             if save_steps and global_step % int(save_steps) == 0:
-                last_checkpoint = _save_checkpoint(
-                    model=model,
-                    optimizer=optimizer,
-                    scheduler=scheduler,
-                    scaler=scaler,
-                    output_dir=output_dir,
-                    name=f"step_{global_step}",
-                    tokenizer=tokenizer,
-                    extra_state={"epoch": epoch, "global_step": global_step},
+                _save_checkpoint(
+                    model=model, optimizer=optimizer, scheduler=scheduler,
+                    scaler=scaler, output_dir=output_dir, name=f"step_{global_step}",
+                    tokenizer=tokenizer, extra_state={"epoch": epoch, "global_step": global_step}
                 )
 
             if max_steps is not None and global_step >= int(max_steps):
+                should_stop = True
                 break
 
-        if max_steps is not None and global_step >= int(max_steps):
-            break
+        # Cuối mỗi epoch: Ghi mẫu dịch & dọn cache
+        if not should_stop and eval_dataloader is not None:
+            _write_epoch_sample_translations(epoch + 1, model, eval_dataloader, tokenizer, output_dir, generation_kwargs)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-        if eval_dataloader is not None:
-            _write_epoch_sample_translations(
-                epoch=epoch + 1,
-                model=model,
-                eval_dataloader=eval_dataloader,
-                tokenizer=tokenizer,
-                output_dir=output_dir,
-                generation_kwargs=generation_kwargs,
-            )
-
+    # --- 5. KẾT THÚC ---
     if eval_dataloader is not None and bool(_cfg(config, "run_eval_at_end", True)):
-        final_metrics = evaluate_model(
-            model=model,
-            eval_dataloader=eval_dataloader,
-            tokenizer=tokenizer,
-            device=active_device,
-            generation_kwargs=generation_kwargs,
-            ignore_index=ignore_index,
-        )
-        LOGGER.info("final eval metrics=%s", final_metrics)
+        final_metrics = evaluate_model(model, eval_dataloader, tokenizer, active_device, generation_kwargs, ignore_index)
         _wandb_log(wandb_run, final_metrics, step=global_step)
 
     last_checkpoint = _save_checkpoint(
-        model=model,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        scaler=scaler,
-        output_dir=output_dir,
-        name="last",
-        tokenizer=tokenizer,
+        model=model, optimizer=optimizer, scheduler=scheduler, scaler=scaler,
+        output_dir=output_dir, name="last", tokenizer=tokenizer,
         extra_state={"epoch": current_epoch, "global_step": global_step, "best_metric": best_metric},
     )
 
-    if wandb_run is not None:
-        try:
-            wandb_run.finish()
-        except Exception:
-            LOGGER.warning("W&B run finish failed.")
+    if wandb_run:
+        wandb_run.finish()
 
     return {
         "global_step": global_step,
         "best_metric": best_metric,
         "best_checkpoint": best_checkpoint,
         "last_checkpoint": last_checkpoint,
-        "metric_for_best_model": metric_for_best,
     }

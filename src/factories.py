@@ -139,17 +139,18 @@ def _get_shared_objects(config=None):
     vocab_trg.build_vocabulary(trg_tokens)
 
     _CACHE["objects"] = tokenizer_src, tokenizer_trg, vocab_src, vocab_trg
+    _CACHE["train_data"] = src_texts, trg_texts
     return _CACHE["objects"]
 
 
 def build_tokenizer(config):
-    tokenizer_src = VietnameseTokenizer(tokenizer_type="bpe")
-    tokenizer_trg = EnglishBPETokenizer()
+    tokenizer_src, tokenizer_trg, _, _ = _get_shared_objects(config)
     return tokenizer_src, tokenizer_trg
 
 
 def build_train_dataloader(config=None):
-    src_texts, trg_texts = _build_data(config, split="train")
+    _get_shared_objects(config)
+    src_texts, trg_texts = _CACHE["train_data"]
     tokenizer_src, tokenizer_trg, vocab_src, vocab_trg = _get_shared_objects(config)
 
     batch_size = int(_cfg(config, "batch_size", 32))
