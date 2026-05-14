@@ -2,25 +2,32 @@ import random
 import torch
 
 class TranslationDataset:
-    def __init__(self, src_texts, trg_texts, vocab_src, vocab_trg, tokenizer_src, tokenizer_trg, max_len=0.95):
+    def __init__(self, src_texts, trg_texts, vocab_src, vocab_trg,
+                 tokenizer_src, tokenizer_trg, max_len=128,
+                 src_ids=None, trg_ids=None):
+        self.src_texts = src_texts
+        self.trg_texts = trg_texts
+        self.vocab_trg = vocab_trg         
         self.src_data = []
         self.trg_data = []
 
+        # Nếu đã có IDs sẵn, bỏ qua tokenization hoàn toàn
+        if src_ids is not None and trg_ids is not None:
+            print(f"Đang load {len(src_ids)} câu từ cache (không tokenize lại)...")
+            self.src_data = src_ids
+            self.trg_data = trg_ids
+            print("Hoàn tất!")
+            return
+
+        # tokenize bình thường (dùng cho eval set)
         print(f"Đang tiền xử lý {len(src_texts)} câu...")
-        
         for s_text, t_text in zip(src_texts, trg_texts):
-            # 1. Tokenize (Sử dụng hàm encode đã có cache)
             s_tokens = tokenizer_src.encode(s_text)[:max_len - 2]
             t_tokens = tokenizer_trg.encode(t_text)[:max_len - 2]
-
-            # 2. Chuyển sang ID và thêm SOS/EOS
             s_ids = [vocab_src.stoi["<sos>"]] + vocab_src.numericalize(s_tokens) + [vocab_src.stoi["<eos>"]]
             t_ids = [vocab_trg.stoi["<sos>"]] + vocab_trg.numericalize(t_tokens) + [vocab_trg.stoi["<eos>"]]
-
-            # 3. Lưu sẵn dưới dạng Tensor
             self.src_data.append(torch.tensor(s_ids, dtype=torch.long))
             self.trg_data.append(torch.tensor(t_ids, dtype=torch.long))
-        
         print("Tiền xử lý hoàn tất!")
 
     def __getitem__(self, idx):

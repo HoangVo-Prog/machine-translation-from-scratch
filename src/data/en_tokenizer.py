@@ -1,3 +1,4 @@
+import json
 import re
 import string
 
@@ -15,6 +16,27 @@ class EnglishBPETokenizer:
             "'ve": " have", "'d": " would", "n't": " not"
         }
         self.cache = {}  # Cache cho encode nếu cần thiết (hiện tại chưa dùng)
+
+    def save(self, path: str):
+        data = {
+            "tokenizer_type": self.tokenizer_type,
+            "num_merges": self.num_merges,
+            # key là tuple → chuyển thành "a|b" để JSON serialize được
+            "merges": {f"{p[0]}|{p[1]}": v for p, v in self.merges.items()},
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+
+    @classmethod
+    def load(cls, path: str) -> "EnglishBPETokenizer":
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        tok = cls(
+            num_merges=data["num_merges"],
+            tokenizer_type=data["tokenizer_type"],
+        )
+        tok.merges = {tuple(k.split("|", 1)): v for k, v in data["merges"].items()}
+        return tok
 
     def clean_text_en(self, text):
         if not text:

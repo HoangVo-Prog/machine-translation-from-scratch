@@ -130,6 +130,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--generation_top_k", type=int, default=None)
     parser.add_argument("--generation_top_p", type=float, default=None)
     parser.add_argument("--generation_repetition_penalty", type=float, default=None)
+    parser.add_argument("--tokenizer_cache_dir", type=str, default=None)
 
     return parser
 
@@ -144,7 +145,7 @@ def _merge_cli_flags_into_config(args, config):
         "label_smoothing", "warmup_steps", "warmup_ratio",
         "scheduler_type", "max_grad_norm", "eval_steps",
         "save_steps", "logging_steps", "metric_for_best_model",
-        "resume_from_checkpoint", "wandb_mode", "wandb_project", "wandb_entity", "wandb_run_name", "wandb_id", "wandb_resume", "wandb_log_steps",
+        "resume_from_checkpoint", "tokenizer_cache_dir", "wandb_mode", "wandb_project", "wandb_entity", "wandb_run_name", "wandb_id", "wandb_resume", "wandb_log_steps",
         "dropout", "optimizer_type", "early_stopping_patience", "min_lr",
         "generation_temperature", "generation_top_k", "generation_top_p", "generation_repetition_penalty",
     ]

@@ -8,7 +8,7 @@ from src.models.decoder import Decoder
 from src.models.seq2seq import Seq2Seq
 from src.models.attentions import BahdanauAttention
 
-from src.data.dataset import get_dataloader
+from src.data.dataset import TranslationDataLoader, CollateBatch, TranslationDataset, get_dataloader
 from src.data.vocab import Vocabulary
 from src.data.vi_tokenizer import VietnameseTokenizer
 from src.data.en_tokenizer import EnglishBPETokenizer
@@ -121,25 +121,83 @@ def _get_shared_objects(config=None):
     if "objects" in _CACHE:
         return _CACHE["objects"]
 
+    root = _repo_root()
+    cache_dir = root / _cfg(config, "tokenizer_cache_dir", "checkpoints/tokenizers")
+
+    src_ckpt      = cache_dir / "tokenizer_src.json"
+    trg_ckpt      = cache_dir / "tokenizer_trg.json"
+    vocab_src_ckpt = cache_dir / "vocab_src.pkl"
+    vocab_trg_ckpt = cache_dir / "vocab_trg.pkl"
+    ids_ckpt       = cache_dir / "train_ids.pt"
+
+    if not cache_dir.exists():
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
     src_texts, trg_texts = _build_data(config, split="train")
+    max_len = _normalize_max_len(_cfg(config, "max_len", 128))
 
-    tokenizer_src = EnglishBPETokenizer(tokenizer_type="bpe", num_merges=int(_cfg(config, "num_merges", 50)))
-    tokenizer_src.train(src_texts)
+    # --- Load tokenizer ---
+    if src_ckpt.exists() and trg_ckpt.exists():
+        LOGGER.info("Tìm thấy BPE checkpoint, bỏ qua train BPE.")
+        tokenizer_src = EnglishBPETokenizer.load(str(src_ckpt))
+        tokenizer_trg = VietnameseTokenizer.load(str(trg_ckpt))
+    else:
+        LOGGER.info("Không có BPE checkpoint, bắt đầu train BPE...")
+        tokenizer_src = EnglishBPETokenizer(tokenizer_type="bpe", num_merges=int(_cfg(config, "num_merges", 50)))
+        tokenizer_src.train(src_texts)
+        tokenizer_src.save(str(src_ckpt))
 
-    tokenizer_trg = VietnameseTokenizer(tokenizer_type="bpe", num_merges=int(_cfg(config, "num_merges", 50)))
-    tokenizer_trg.train(trg_texts)
+        tokenizer_trg = VietnameseTokenizer(tokenizer_type="bpe", num_merges=int(_cfg(config, "num_merges", 50)))
+        tokenizer_trg.train(trg_texts)
+        tokenizer_trg.save(str(trg_ckpt))
+        LOGGER.info("Đã lưu BPE checkpoint vào %s", cache_dir)
 
-    vocab_src = Vocabulary(freq_threshold=int(_cfg(config, "src_freq_threshold", 1)))
-    vocab_trg = Vocabulary(freq_threshold=int(_cfg(config, "trg_freq_threshold", 1)))
+    # --- Load vocab + IDs nếu đã có checkpoint ---
+    if vocab_src_ckpt.exists() and vocab_trg_ckpt.exists() and ids_ckpt.exists():
+        LOGGER.info("Tìm thấy vocab + IDs checkpoint, bỏ qua tokenizing.")
+        import pickle
+        with open(vocab_src_ckpt, "rb") as f:
+            vocab_src = pickle.load(f)
+        with open(vocab_trg_ckpt, "rb") as f:
+            vocab_trg = pickle.load(f)
+        saved = torch.load(ids_ckpt)
+        src_ids = saved["src_ids"]
+        trg_ids = saved["trg_ids"]
+    else:
+        # --- Tokenize + build vocab + numericalize ---
+        vocab_src = Vocabulary(freq_threshold=int(_cfg(config, "src_freq_threshold", 1)))
+        vocab_trg = Vocabulary(freq_threshold=int(_cfg(config, "trg_freq_threshold", 1)))
 
-    src_tokens = [["<sos>"] + tokenizer_src.encode(text) + ["<eos>"] for text in src_texts]
-    trg_tokens = [["<sos>"] + tokenizer_trg.encode(text) + ["<eos>"] for text in trg_texts]
+        print(f"Tokenizing {len(src_texts)} câu (1 lần duy nhất)...")
+        src_tokens = [["<sos>"] + tokenizer_src.encode(text)[:max_len - 2] + ["<eos>"] for text in src_texts]
+        trg_tokens = [["<sos>"] + tokenizer_trg.encode(text)[:max_len - 2] + ["<eos>"] for text in trg_texts]
 
-    vocab_src.build_vocabulary(src_tokens)
-    vocab_trg.build_vocabulary(trg_tokens)
+        vocab_src.build_vocabulary(src_tokens)
+        vocab_trg.build_vocabulary(trg_tokens)
+
+        print("Numericalizing...")
+        src_ids = [torch.tensor([vocab_src.stoi.get(t, vocab_src.stoi["<unk>"]) for t in toks], dtype=torch.long)
+                   for toks in src_tokens]
+        trg_ids = [torch.tensor([vocab_trg.stoi.get(t, vocab_trg.stoi["<unk>"]) for t in toks], dtype=torch.long)
+                   for toks in trg_tokens]
+        print("Hoàn tất tiền xử lý!")
+
+        # --- Lưu vocab + IDs vào cache_dir ---
+        # Chỉ lưu nếu cache_dir writable
+        try:
+            import pickle
+            with open(vocab_src_ckpt, "wb") as f:
+                pickle.dump(vocab_src, f)
+            with open(vocab_trg_ckpt, "wb") as f:
+                pickle.dump(vocab_trg, f)
+            torch.save({"src_ids": src_ids, "trg_ids": trg_ids}, ids_ckpt)
+            LOGGER.info("Đã lưu vocab + IDs vào %s", cache_dir)
+        except OSError as e:
+            LOGGER.warning("Không lưu được vocab/IDs cache: %s", e)
 
     _CACHE["objects"] = tokenizer_src, tokenizer_trg, vocab_src, vocab_trg
     _CACHE["train_data"] = src_texts, trg_texts
+    _CACHE["train_ids"] = src_ids, trg_ids
     return _CACHE["objects"]
 
 
@@ -149,24 +207,21 @@ def build_tokenizer(config):
 
 
 def build_train_dataloader(config=None):
-    _get_shared_objects(config)
-    src_texts, trg_texts = _CACHE["train_data"]
     tokenizer_src, tokenizer_trg, vocab_src, vocab_trg = _get_shared_objects(config)
+    src_texts, trg_texts = _CACHE["train_data"]
+    src_ids, trg_ids = _CACHE["train_ids"]          # ★ lấy IDs đã xử lý
 
     batch_size = int(_cfg(config, "batch_size", 32))
     max_len = _normalize_max_len(_cfg(config, "max_len", 128))
 
-    return get_dataloader(
-        src_texts=src_texts,
-        trg_texts=trg_texts,
-        vocab_src=vocab_src,
-        vocab_trg=vocab_trg,
-        tokenizer_src=tokenizer_src,
-        tokenizer_trg=tokenizer_trg,
-        batch_size=batch_size,
-        max_len=max_len,
-        shuffle=True,
+    dataset = TranslationDataset(
+        src_texts, trg_texts, vocab_src, vocab_trg,
+        tokenizer_src, tokenizer_trg, max_len=max_len,
+        src_ids=src_ids, trg_ids=trg_ids,           # ★ bypass tokenization
     )
+    collate_fn = CollateBatch(pad_idx_src=vocab_src.stoi['<pad>'],
+                              pad_idx_trg=vocab_trg.stoi['<pad>'])
+    return TranslationDataLoader(dataset, batch_size, collate_fn, shuffle=True)
 
 
 def build_eval_dataloader(config=None):

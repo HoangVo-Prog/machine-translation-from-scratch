@@ -231,6 +231,19 @@ def _save_checkpoint(
     if tokenizer is not None and hasattr(tokenizer, "save_pretrained"):
         tokenizer.save_pretrained(str(checkpoint_dir))
 
+    # Lưu vocab + tokenizer nếu có trong cache
+    try:
+        import pickle
+        from src.factories import _CACHE
+        if "objects" in _CACHE:
+            _, _, vocab_src, vocab_trg = _CACHE["objects"]
+            with open(checkpoint_dir / "vocab_src.pkl", "wb") as f:
+                pickle.dump(vocab_src, f)
+            with open(checkpoint_dir / "vocab_trg.pkl", "wb") as f:
+                pickle.dump(vocab_trg, f)
+    except Exception as exc:
+        LOGGER.warning("Không lưu được vocab: %s", exc)
+
     state = {
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict() if scheduler is not None else None,
@@ -315,9 +328,14 @@ def _append_translation_samples(csv_path: Path, rows: list[list[Any]]) -> None:
         writer.writerows(rows)
 
 
-def _get_fixed_eval_samples(eval_dataloader: Any, num_samples: int = 5) -> tuple[list[tuple[str, str]], torch.Tensor | None, torch.Tensor | None]:
+def _get_fixed_eval_samples(eval_dataloader, num_samples=5):
     dataset = getattr(eval_dataloader, "dataset", None)
     if dataset is None:
+        return [], None, None
+
+    # Guard: kiểm tra attribute tồn tại
+    if not hasattr(dataset, "src_texts") or not hasattr(dataset, "trg_texts"):
+        LOGGER.warning("Dataset thiếu src_texts/trg_texts, bỏ qua sample logging.")
         return [], None, None
 
     total = min(num_samples, len(dataset))
@@ -578,6 +596,18 @@ def train(
 
         # Cuối mỗi epoch: Ghi mẫu dịch & dọn cache
         if not should_stop and eval_dataloader is not None:
+            metrics = evaluate_model(          # ← thêm block này
+                model=model,
+                eval_dataloader=eval_dataloader,
+                tokenizer=tokenizer,
+                device=active_device,
+                generation_kwargs=generation_kwargs,
+                ignore_index=ignore_index,
+            )
+            _wandb_log(wandb_run, metrics, step=global_step)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
             _write_epoch_sample_translations(epoch + 1, model, eval_dataloader, tokenizer, output_dir, generation_kwargs)
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()

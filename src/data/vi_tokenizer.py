@@ -1,3 +1,4 @@
+import json
 import re
 import os
 import unicodedata
@@ -13,6 +14,27 @@ class VietnameseTokenizer:
         self.cache = {}
 
     # --- Các hàm bổ trợ (Tiền xử lý) ---
+
+    def save(self, path: str):
+        data = {
+            "tokenizer_type": self.tokenizer_type,
+            "num_merges": self.num_merges,
+            "merges": {f"{p[0]}|{p[1]}": v for p, v in self.merges.items()},
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+
+    @classmethod
+    def load(cls, path: str, dict_path: str = "src/data/vi_words.txt") -> "VietnameseTokenizer":
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        tok = cls(
+            num_merges=data["num_merges"],
+            tokenizer_type=data["tokenizer_type"],
+            dict_path=dict_path,
+        )
+        tok.merges = {tuple(k.split("|", 1)): v for k, v in data["merges"].items()}
+        return tok
 
     def _load_vi_words(self, file_path):
         if not os.path.exists(file_path):
