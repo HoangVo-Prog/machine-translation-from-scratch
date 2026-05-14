@@ -37,17 +37,15 @@ class CollateBatch:
 
     def __call__(self, batch):
         src_batch, trg_batch = zip(*batch)
-
-        # Dynamic Padding: Chỉ pad đến câu dài nhất TRONG BATCH NÀY
         src_padded = self._pad_sequences(src_batch, self.pad_idx_src)
         trg_padded = self._pad_sequences(trg_batch, self.pad_idx_trg)
-
-        # Tạo mask: Vị trí nào là padding thì True (hoặc 1)
-        # Lưu ý: Transformer thường cần mask kiểu (batch, 1, 1, seq_len) hoặc (batch, seq_len)
         src_mask = (src_padded == self.pad_idx_src)
         trg_mask = (trg_padded == self.pad_idx_trg)
 
-        return src_padded, trg_padded, src_mask, trg_mask
+        # Tính độ dài thực của từng câu source
+        src_lengths = torch.tensor([len(s) for s in src_batch], dtype=torch.long)
+
+        return src_padded, trg_padded, src_mask, trg_mask, src_lengths
 
     def _pad_sequences(self, sequences, pad_idx):
         max_len = max([len(seq) for seq in sequences])

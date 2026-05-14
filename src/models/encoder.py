@@ -91,42 +91,19 @@ class Encoder(nn.Module):
 
 
     def forward(self, src: torch.Tensor, src_lengths=None):
-        """
-        Parameters
-        ----------
-        src        : LongTensor [batch, src_len]  – token indices chuỗi nguồn
-        src_lengths: (tuỳ chọn) LongTensor [batch] – độ dài thực của mỗi câu
-                     (dùng để mask padding trong attention sau này)
-
-        Returns
-        -------
-        encoder_outputs : FloatTensor [batch, src_len, hidden_size]
-                          Hidden state của layer cuối tại mỗi bước thời gian.
-                          Attention sẽ dùng tensor này.
-
-        final_hidden    : tuple  –  trạng thái cuối của từng layer
-            - GRU / RNN : tuple of Tensor  [num_layers, batch, hidden_size]
-            - LSTM       : (h_n, c_n) mỗi cái shape [num_layers, batch, hidden_size]
-        """
         batch_size, src_len = src.size()
         device = src.device
 
-        # 1. Embedding: [batch, src_len] → [batch, src_len, embed_dim]
-        embedded = self.embedding(src)          # gọi forward của Embedding from scratch
-
-        # 2. Khởi tạo hidden states
+        embedded = self.embedding(src)
         states = self._init_hidden(batch_size, device)
-
-        # 3. Chạy qua từng bước thời gian
-        #    encoder_outputs lưu hidden state của layer CUỐI tại mỗi step
         encoder_outputs = []
+        # Lưu states tại mỗi bước để gather về sau (chỉ dùng khi src_lengths != None)
+        all_states = []  # list[src_len] of states
 
         for t in range(src_len):
-            x_t = embedded[:, t, :]             # [batch, embed_dim]
-
+            x_t = embedded[:, t, :]
             new_states = []
             for layer_idx, cell in enumerate(self.cells):
-                # Lấy hidden (và cell) state của layer này
                 if self.cell_type == "lstm":
                     h_prev, c_prev = states[layer_idx]
                     h_t, c_t = cell.step(x_t, h_prev, c_prev)
@@ -135,23 +112,56 @@ class Encoder(nn.Module):
                     (h_prev,) = states[layer_idx]
                     h_t = cell.step(x_t, h_prev)
                     new_states.append((h_t,))
-
-                # Input của layer tiếp theo là h_t hiện tại (qua dropout nếu không phải layer cuối)
-                if layer_idx < self.num_layers - 1:
-                    x_t = self.dropout(h_t)
-                else:
-                    x_t = h_t   # không dropout ở layer cuối
-
+                x_t = self.dropout(h_t) if layer_idx < self.num_layers - 1 else h_t
             states = new_states
-            encoder_outputs.append(x_t)         # x_t == h_t của layer cuối
+            all_states.append(states)          # lưu snapshot tại t
+            encoder_outputs.append(x_t)
 
-        # 4. Stack encoder_outputs: list[src_len × [batch, hidden]] → [batch, src_len, hidden]
         encoder_outputs = torch.stack(encoder_outputs, dim=1)
 
-        # 5. Đóng gói final_hidden để truyền sang Decoder
-        final_hidden = self._pack_final_hidden(states)
+        # dùng src_lengths để chọn đúng snapshot
+        if src_lengths is not None:
+            final_hidden = self._gather_states_at(all_states, src_lengths, device)
+        else:
+            final_hidden = self._pack_final_hidden(states)
 
         return encoder_outputs, final_hidden
+
+
+    def _gather_states_at(self, all_states, src_lengths, device):
+        """
+        Với mỗi sample i trong batch, lấy states tại bước t = src_lengths[i] - 1.
+        all_states : list[src_len] of list[num_layers] of tuple(h, ?) 
+        """
+        lengths = src_lengths.to(device)
+        batch_size = lengths.size(0)
+
+        if self.cell_type == "lstm":
+            h_layers, c_layers = [], []
+            for layer_idx in range(self.num_layers):
+                # Stack h của layer này theo thời gian: [src_len, batch, hidden]
+                h_t_stack = torch.stack([all_states[t][layer_idx][0] for t in range(len(all_states))], dim=0)
+                c_t_stack = torch.stack([all_states[t][layer_idx][1] for t in range(len(all_states))], dim=0)
+                # Gather tại vị trí cuối thực của từng sample
+                last_idx = (lengths - 1).clamp(min=0, max=h_t_stack.size(0) - 1)
+                # idx: [batch] → [batch, 1, hidden] để gather trên dim=0
+                # Dùng vòng lặp đơn giản cho rõ ràng
+                h_last = h_t_stack[last_idx, torch.arange(batch_size, device=device)]
+                c_last = c_t_stack[last_idx, torch.arange(batch_size, device=device)]
+                h_layers.append(h_last)
+                c_layers.append(c_last)
+            h_n = torch.stack(h_layers, dim=0)  # [num_layers, batch, hidden]
+            c_n = torch.stack(c_layers, dim=0)
+            return (h_n, c_n)
+        else:
+            h_layers = []
+            for layer_idx in range(self.num_layers):
+                h_t_stack = torch.stack([all_states[t][layer_idx][0] for t in range(len(all_states))], dim=0)
+                last_idx = (lengths - 1).clamp(min=0, max=h_t_stack.size(0) - 1)
+                h_last = h_t_stack[last_idx, torch.arange(batch_size, device=device)]
+                h_layers.append(h_last)
+            return torch.stack(h_layers, dim=0)
+
 
     def _pack_final_hidden(self, states):
         """
