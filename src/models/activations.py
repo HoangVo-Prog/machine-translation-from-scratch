@@ -25,9 +25,19 @@ def softmax(x):
     e_x = torch.exp(x - torch.max(x, dim=-1, keepdim=True)[0])
     return e_x / torch.sum(e_x, dim=-1, keepdim=True)
 
+
+def log_softmax(x):
+    """
+    Compute the log-softmax of x.
+    """
+    shifted = x - torch.max(x, dim=-1, keepdim=True)[0]
+    log_sum_exp = torch.log(torch.sum(torch.exp(shifted), dim=-1, keepdim=True))
+    return shifted - log_sum_exp
+
 __all__ = [
     'sigmoid',
     'relu',
     'tanh',
-    'softmax'
+    'softmax',
+    'log_softmax'
 ]

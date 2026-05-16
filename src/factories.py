@@ -43,41 +43,90 @@ def _normalize_max_len(raw_max_len, default: int = 128, min_len: int = 4) -> int
     return value
 
 
+def _resolve_max_len(
+    raw_max_len,
+    src_texts,
+    trg_texts,
+    tokenizer_src,
+    tokenizer_trg,
+    default: int = 128,
+    min_len: int = 4,
+) -> int:
+    """Resolve max_len from absolute length or quantile ratio."""
+    try:
+        value = float(raw_max_len)
+    except (TypeError, ValueError):
+        LOGGER.warning("Invalid max_len=%r. Falling back to default=%s.", raw_max_len, default)
+        return default
+
+    if 0.0 < value <= 1.0:
+        lengths = []
+        for src_text, trg_text in zip(src_texts, trg_texts):
+            src_len = len(tokenizer_src.encode(src_text)) + 2
+            trg_len = len(tokenizer_trg.encode(trg_text)) + 2
+            lengths.append(max(src_len, trg_len))
+
+        if not lengths:
+            LOGGER.warning("Empty corpus while resolving max_len quantile. Falling back to default=%s.", default)
+            return default
+
+        lengths_tensor = torch.tensor(lengths, dtype=torch.float32)
+        quantile_len = int(torch.quantile(lengths_tensor, value).item())
+        quantile_len = max(min_len, quantile_len)
+        LOGGER.info("Resolved max_len from quantile p=%.3f -> %s", value, quantile_len)
+        return quantile_len
+
+    return _normalize_max_len(value, default=default, min_len=min_len)
+
+
 def _read_jsonl_parallel(path: Path):
     src_texts = []
     trg_texts = []
 
+    key_pairs = [
+        ("src", "trg"),
+        ("source", "target"),
+        ("en", "vi"),
+        ("english", "vietnamese"),
+        ("input", "output"),
+    ]
+
+    skipped = 0
+
     with path.open("r", encoding="utf-8") as f:
-        for line in f:
+        for line_no, line in enumerate(f, start=1):
             if not line.strip():
                 continue
 
             obj = json.loads(line)
 
-            src = (
-                obj.get("src")
-                or obj.get("source")
-                or obj.get("en")
-                or obj.get("english")
-                or obj.get("input")
-            )
+            src = None
+            trg = None
 
-            trg = (
-                obj.get("trg")
-                or obj.get("target")
-                or obj.get("vi")
-                or obj.get("vietnamese")
-                or obj.get("output")
-            )
+            for src_key, trg_key in key_pairs:
+                if src_key in obj and trg_key in obj:
+                    src = obj[src_key]
+                    trg = obj[trg_key]
+                    break
 
             if src is None or trg is None:
                 raise ValueError(
-                    f"Không tìm thấy cặp source/target trong dòng JSONL: {obj.keys()}"
+                    f"Dòng {line_no}: thiếu cặp source/target. "
+                    f"Keys={list(obj.keys())}, obj={obj}"
                 )
 
-            src_texts.append(str(src).strip())
-            trg_texts.append(str(trg).strip())
+            src = str(src).strip()
+            trg = str(trg).strip()
 
+            # Bỏ dòng bẩn: rỗng hoặc chỉ có 1 ký tự/ký hiệu
+            if len(src) < 2 or len(trg) < 2:
+                skipped += 1
+                continue
+
+            src_texts.append(src)
+            trg_texts.append(trg)
+
+    print(f"Loaded {len(src_texts)} pairs from {path}, skipped {skipped} bad lines")
     return src_texts, trg_texts
 
 
@@ -94,27 +143,13 @@ def _read_raw_parallel(en_path: Path, vi_path: Path):
     return src_texts, trg_texts
 
 
-def _build_data(config=None, split="train"):
-    root = _repo_root()
-
-    file_key = "train_file" if split == "train" else "eval_file"
-    file_path = _cfg(config, file_key, None)
-
-    if file_path:
-        path = root / file_path
-        if not path.exists():
-            path = Path(file_path)
-
-        if not path.exists():
-            raise FileNotFoundError(f"Không tìm thấy {file_key}: {file_path}")
-
-        if path.suffix == ".jsonl":
-            return _read_jsonl_parallel(path)
-
-        raise ValueError(f"Hiện chỉ hỗ trợ JSONL cho {file_key}: {path}")
-
-    data_dir = root / "data"
-    return _read_raw_parallel(data_dir / "en_sents", data_dir / "vi_sents")
+def _parse_bool(value) -> bool:
+    """Parse boolean từ nhiều format: True, 'true', 'yes', '1', etc."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.lower() in ('true', 'yes', '1', 't', 'y')
+    return bool(value)
 
 
 def _get_shared_objects(config=None):
@@ -134,7 +169,6 @@ def _get_shared_objects(config=None):
         cache_dir.mkdir(parents=True, exist_ok=True)
 
     src_texts, trg_texts = _build_data(config, split="train")
-    max_len = _normalize_max_len(_cfg(config, "max_len", 128))
 
     # --- Load tokenizer ---
     if src_ckpt.exists() and trg_ckpt.exists():
@@ -151,6 +185,14 @@ def _get_shared_objects(config=None):
         tokenizer_trg.train(trg_texts)
         tokenizer_trg.save(str(trg_ckpt))
         LOGGER.info("Đã lưu BPE checkpoint vào %s", cache_dir)
+
+    max_len = _resolve_max_len(
+        raw_max_len=_cfg(config, "max_len", 128),
+        src_texts=src_texts,
+        trg_texts=trg_texts,
+        tokenizer_src=tokenizer_src,
+        tokenizer_trg=tokenizer_trg,
+    )
 
     # --- Load vocab + IDs nếu đã có checkpoint ---
     if vocab_src_ckpt.exists() and vocab_trg_ckpt.exists() and ids_ckpt.exists():
@@ -198,7 +240,31 @@ def _get_shared_objects(config=None):
     _CACHE["objects"] = tokenizer_src, tokenizer_trg, vocab_src, vocab_trg
     _CACHE["train_data"] = src_texts, trg_texts
     _CACHE["train_ids"] = src_ids, trg_ids
+    _CACHE["max_len"] = max_len
     return _CACHE["objects"]
+
+
+def _build_data(config=None, split="train"):
+    root = _repo_root()
+
+    file_key = "train_file" if split == "train" else "eval_file"
+    file_path = _cfg(config, file_key, None)
+
+    if file_path:
+        path = root / file_path
+        if not path.exists():
+            path = Path(file_path)
+
+        if not path.exists():
+            raise FileNotFoundError(f"Không tìm thấy {file_key}: {file_path}")
+
+        if path.suffix == ".jsonl":
+            return _read_jsonl_parallel(path)
+
+        raise ValueError(f"Hiện chỉ hỗ trợ JSONL cho {file_key}: {path}")
+
+    data_dir = root / "data"
+    return _read_raw_parallel(data_dir / "en_sents", data_dir / "vi_sents")
 
 
 def build_tokenizer(config):
@@ -212,7 +278,7 @@ def build_train_dataloader(config=None):
     src_ids, trg_ids = _CACHE["train_ids"]          # ★ lấy IDs đã xử lý
 
     batch_size = int(_cfg(config, "batch_size", 32))
-    max_len = _normalize_max_len(_cfg(config, "max_len", 128))
+    max_len = int(_CACHE.get("max_len", _normalize_max_len(_cfg(config, "max_len", 128))))
 
     dataset = TranslationDataset(
         src_texts, trg_texts, vocab_src, vocab_trg,
@@ -235,7 +301,7 @@ def build_eval_dataloader(config=None):
         trg_texts = trg_texts[:eval_max_samples]
 
     batch_size = int(_cfg(config, "eval_batch_size", _cfg(config, "batch_size", 32)))
-    max_len = _normalize_max_len(_cfg(config, "max_len", 128))
+    max_len = int(_CACHE.get("max_len", _normalize_max_len(_cfg(config, "max_len", 128))))
 
     return get_dataloader(
         src_texts=src_texts,
@@ -259,6 +325,9 @@ def build_model(config=None):
     num_layers = int(_cfg(config, "num_layers", 1))
     cell_type = str(_cfg(config, "cell_type", "gru"))
     dropout = float(_cfg(config, "dropout", 0.1))
+    
+    use_attention_raw = _cfg(config, "use_attention", False)
+    use_attention = _parse_bool(use_attention_raw)
 
     encoder = Encoder(
         vocab_size=len(vocab_src),
@@ -269,11 +338,14 @@ def build_model(config=None):
         dropout=dropout,
     )
 
-    attention = BahdanauAttention(
-        encoder_hidden_dim=hidden_size,
-        decoder_hidden_dim=hidden_size,
-        attention_dim=attention_dim,
-    )
+    # ★ Tạo attention nếu cần
+    attention = None
+    if use_attention:
+        attention = BahdanauAttention(
+            encoder_hidden_dim=hidden_size,
+            decoder_hidden_dim=hidden_size,
+            attention_dim=attention_dim,
+        )
 
     decoder = Decoder(
         vocab_size=len(vocab_trg),

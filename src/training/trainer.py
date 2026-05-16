@@ -9,6 +9,7 @@ import os
 from collections.abc import Mapping
 from contextlib import nullcontext
 from pathlib import Path
+import string
 from typing import Any
 
 import torch
@@ -231,19 +232,6 @@ def _save_checkpoint(
     if tokenizer is not None and hasattr(tokenizer, "save_pretrained"):
         tokenizer.save_pretrained(str(checkpoint_dir))
 
-    # Lưu vocab + tokenizer nếu có trong cache
-    try:
-        import pickle
-        from src.factories import _CACHE
-        if "objects" in _CACHE:
-            _, _, vocab_src, vocab_trg = _CACHE["objects"]
-            with open(checkpoint_dir / "vocab_src.pkl", "wb") as f:
-                pickle.dump(vocab_src, f)
-            with open(checkpoint_dir / "vocab_trg.pkl", "wb") as f:
-                pickle.dump(vocab_trg, f)
-    except Exception as exc:
-        LOGGER.warning("Không lưu được vocab: %s", exc)
-
     state = {
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict() if scheduler is not None else None,
@@ -307,15 +295,64 @@ def _compute_total_training_steps(
     return steps_per_epoch * max(1, num_epochs)
 
 
-def _decode_predictions(tokenizer: Any, sequences: Any, ignore_index: int = -100) -> list[str]:
-    if tokenizer is not None and hasattr(tokenizer, "batch_decode"):
-        return tokenizer.batch_decode(sequences, skip_special_tokens=True)
-
+def _decode_predictions(
+    tokenizer: Any,
+    sequences: Any,
+    ignore_index: int = -100,
+    vocab: Any | None = None,
+) -> list[str]:
     if torch.is_tensor(sequences):
         sequences = sequences.detach().cpu().tolist()
+
+    if sequences is None:
+        return []
+
+    if tokenizer is not None and hasattr(tokenizer, "batch_decode"):
+        cleaned = [
+            [int(tok) for tok in seq if int(tok) != ignore_index]
+            for seq in sequences
+        ]
+        return tokenizer.batch_decode(cleaned, skip_special_tokens=True)
+
+    if vocab is not None:
+        itos = getattr(vocab, "itos", None)
+        if itos is None:
+            itos = getattr(vocab, "id_to_token", None)
+        if itos is None:
+            itos = getattr(vocab, "idx_to_token", None)
+
+        if itos is not None:
+            decoded = []
+            special_tokens = {"<pad>", "<sos>", "<bos>", "<eos>", "<unk>"}
+
+            for seq in sequences:
+                tokens = []
+                for tok in seq:
+                    tok = int(tok)
+                    if tok == ignore_index:
+                        continue
+
+                    if isinstance(itos, dict):
+                        token = itos.get(tok, "")
+                    else:
+                        token = itos[tok] if 0 <= tok < len(itos) else ""
+
+                    if token in special_tokens:
+                        continue
+
+                    tokens.append(token)
+
+                decoded.append(" ".join(tokens))
+
+            return decoded
+
     if isinstance(sequences, (tuple, list)) and sequences and not isinstance(sequences[0], str):
-        return [" ".join(str(int(tok)) for tok in seq if int(tok) != ignore_index) for seq in sequences]
-    return [str(sequences)] if sequences is not None else []
+        return [
+            " ".join(str(int(tok)) for tok in seq if int(tok) != ignore_index)
+            for seq in sequences
+        ]
+
+    return [str(sequences)]
 
 
 def _append_translation_samples(csv_path: Path, rows: list[list[Any]]) -> None:
@@ -401,19 +438,21 @@ def _write_epoch_sample_translations(
             )
         except Exception:
             LOGGER.warning("Epoch %s: unable to generate translation samples; skipping sample logging.", epoch)
-            # Dọn dẹp trước khi thoát nếu lỗi[cite: 4]
             del src_batch
             torch.cuda.empty_cache()
             return
 
-    # Chuyển token sang văn bản (Decode)
-    # Lưu ý: pred_tokens thường là tensor trên GPU, ta nên xử lý xong rồi giải phóng ngay[cite: 1]
-    predictions = _decode_predictions(tokenizer, pred_tokens)
-    
-    rows: list[list[Any]] = []
+    dataset = getattr(eval_dataloader, "dataset", None)
+    vocab_trg = getattr(dataset, "vocab_trg", None) if dataset is not None else None
 
+    sources = [src for src, _ in raw_pairs]
+    decoded_refs = [ref for _, ref in raw_pairs]
+    predictions = _decode_predictions(tokenizer, pred_tokens, vocab=vocab_trg)
+
+    # Log và ghi CSV
+    rows: list[list[Any]] = []
     LOGGER.info("epoch=%s translation samples:", epoch)
-    for index, ((source, reference), prediction) in enumerate(zip(raw_pairs, predictions), start=1):
+    for index, (source, reference, prediction) in enumerate(zip(sources, decoded_refs, predictions), start=1):
         LOGGER.info("epoch=%s sample=%s src=%s", epoch, index, source)
         LOGGER.info("epoch=%s sample=%s ref=%s", epoch, index, reference)
         LOGGER.info("epoch=%s sample=%s pred=%s", epoch, index, prediction)
@@ -426,6 +465,7 @@ def _write_epoch_sample_translations(
     # Giải phóng hoàn toàn các tensor lớn và dọn cache GPU sau khi hoàn tất log
     del src_batch, pred_tokens
     torch.cuda.empty_cache()
+
 
 def train(
     model: torch.nn.Module,
@@ -451,7 +491,7 @@ def train(
     num_epochs = int(_cfg(config, "num_epochs", _cfg(config, "epochs", 1)))
     max_steps = _cfg(config, "max_steps", None)
     grad_accum_steps = int(_cfg(config, "gradient_accumulation_steps", 1))
-    logging_steps = int(_cfg(config, "logging_steps", 10))
+    logging_steps = int(_cfg(config, "logging_steps", 100))
     eval_steps = _cfg(config, "eval_steps", None)
     save_steps = _cfg(config, "save_steps", None)
     ignore_index = int(_cfg(config, "ignore_index", 0))
@@ -558,15 +598,6 @@ def train(
                     device=active_device, generation_kwargs=generation_kwargs, ignore_index=ignore_index,
                 )
                 _wandb_log(wandb_run, metrics, step=global_step)
-                
-                _write_epoch_sample_translations(
-                    epoch + 1,
-                    model,
-                    eval_dataloader,
-                    tokenizer,
-                    output_dir,
-                    generation_kwargs,
-                )
 
                 # Quan trọng: Dọn dẹp cache sau Eval nặng
                 if torch.cuda.is_available():
@@ -598,6 +629,18 @@ def train(
                     scaler=scaler, output_dir=output_dir, name=f"step_{global_step}",
                     tokenizer=tokenizer, extra_state={"epoch": epoch, "global_step": global_step}
                 )
+
+        # Ghi mẫu dịch sau mỗi epoch
+        if not should_stop and eval_dataloader is not None:
+            _write_epoch_sample_translations(
+                epoch + 1,
+                model,
+                eval_dataloader,
+                tokenizer,
+                output_dir,
+                generation_kwargs,
+            )
+
 
     # --- 5. KẾT THÚC ---
     if eval_dataloader is not None and bool(_cfg(config, "run_eval_at_end", True)):

@@ -16,7 +16,7 @@ Cách dùng:
     python translate.py --checkpoint checkpoints/best --text "I love you"
 
     # Chỉ định kiến trúc nếu khác default
-    python translate.py --checkpoint checkpoints/best --hidden_size 256 --embed_dim 256
+    python translate.py --checkpoint checkpoints/best --hidden_size 256 --embed_dim 256 --no-attention
 """
 
 from __future__ import annotations
@@ -34,8 +34,6 @@ from src.models.attentions import BahdanauAttention
 from src.data.en_tokenizer import EnglishBPETokenizer
 from src.data.vi_tokenizer import VietnameseTokenizer
 
-
-# ── Load ────────────────────────────────────────────────────────────────────────
 
 def load_all(checkpoint_dir: str):
     ckpt = Path(checkpoint_dir)
@@ -56,6 +54,10 @@ def load_all(checkpoint_dir: str):
 
 
 def build_model(vocab_src, vocab_trg, args, device) -> Seq2Seq:
+    """
+    Build model từ args, hỗ trợ toggle attention.
+    Logic giống factories.py để đồng nhất.
+    """
     encoder = Encoder(
         vocab_size=len(vocab_src),
         embed_dim=args.embed_dim,
@@ -65,11 +67,14 @@ def build_model(vocab_src, vocab_trg, args, device) -> Seq2Seq:
         dropout=0.0,  # inference không cần dropout
     )
 
-    attention = BahdanauAttention(
-        encoder_hidden_dim=args.hidden_size,
-        decoder_hidden_dim=args.hidden_size,
-        attention_dim=args.attention_dim,
-    )
+    # Tạo attention module (nếu cần)
+    attention = None
+    if args.use_attention:
+        attention = BahdanauAttention(
+            encoder_hidden_dim=args.hidden_size,
+            decoder_hidden_dim=args.hidden_size,
+            attention_dim=args.attention_dim,
+        )
 
     decoder = Decoder(
         vocab_size=len(vocab_trg),
@@ -77,7 +82,7 @@ def build_model(vocab_src, vocab_trg, args, device) -> Seq2Seq:
         hidden_size=args.hidden_size,
         num_layers=args.num_layers,
         cell_type=args.cell_type,
-        attention=attention,
+        attention=attention,  # None nếu không dùng attention
         dropout=0.0,
         eos_token_id=vocab_trg.stoi["<eos>"],
     )
@@ -98,8 +103,6 @@ def build_model(vocab_src, vocab_trg, args, device) -> Seq2Seq:
     model.eval()
     return model
 
-
-# ── Translate ───────────────────────────────────────────────────────────────────
 
 def translate(
     text: str,
@@ -137,8 +140,6 @@ def translate(
     return " ".join(pred_tokens)
 
 
-# ── Main ────────────────────────────────────────────────────────────────────────
-
 def main():
     parser = argparse.ArgumentParser(description="Dịch EN → VI")
 
@@ -160,6 +161,11 @@ def main():
     parser.add_argument("--attention_dim", type=int, default=32)
     parser.add_argument("--num_layers",    type=int, default=1)
     parser.add_argument("--cell_type",     type=str, default="gru")
+    
+    # Toggle attention (mặc định BẬT)
+    parser.add_argument("--no-attention", dest="use_attention", action="store_false",
+                        help="Tắt attention mechanism (mặc định: BẬT)")
+    parser.set_defaults(use_attention=True)
 
     args = parser.parse_args()
 
@@ -168,7 +174,8 @@ def main():
         args.device if args.device
         else ("cuda" if torch.cuda.is_available() else "cpu")
     )
-    print(f"Device: {device}") 
+    print(f"Device: {device}")
+    print(f"Attention: {'Enabled' if args.use_attention else 'Disabled'}")
 
     # Load
     print(f"Đang load checkpoint: {args.checkpoint}")

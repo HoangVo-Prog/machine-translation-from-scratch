@@ -25,10 +25,12 @@ def _load_callable(path: str):
 def _call_factory(fn, config: dict[str, Any]):
     try:
         sig = inspect.signature(fn)
-        if len(sig.parameters) >= 1:
-            return fn(config)
-    except (TypeError, ValueError):
-        pass
+    except ValueError:
+        return fn(config)
+
+    if len(sig.parameters) >= 1:
+        return fn(config)
+
     return fn()
 
 
@@ -123,6 +125,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--max_len", type=float, default=0.95)
     parser.add_argument("--dropout", type=float, default=None)
+    parser.add_argument("--use_attention", type=str, default=None)
     parser.add_argument("--optimizer_type", type=str, default=None)
     parser.add_argument("--early_stopping_patience", type=int, default=None)
     parser.add_argument("--min_lr", type=float, default=None)
@@ -155,7 +158,7 @@ def _merge_cli_flags_into_config(args, config):
         if value is not None:
             merged[key] = value
 
-    for key in ("mixed_precision", "greater_is_better", "wandb_enabled", "wandb_resume"):
+    for key in ("mixed_precision", "greater_is_better", "wandb_enabled", "wandb_resume", "use_attention"):
         raw = getattr(args, key)
         parsed = _read_bool_like(raw) if raw is not None else None
         if parsed is not None:
