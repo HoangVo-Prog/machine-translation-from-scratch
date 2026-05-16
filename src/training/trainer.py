@@ -559,6 +559,15 @@ def train(
                 )
                 _wandb_log(wandb_run, metrics, step=global_step)
                 
+                _write_epoch_sample_translations(
+                    epoch + 1,
+                    model,
+                    eval_dataloader,
+                    tokenizer,
+                    output_dir,
+                    generation_kwargs,
+                )
+
                 # Quan trọng: Dọn dẹp cache sau Eval nặng
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
@@ -589,28 +598,6 @@ def train(
                     scaler=scaler, output_dir=output_dir, name=f"step_{global_step}",
                     tokenizer=tokenizer, extra_state={"epoch": epoch, "global_step": global_step}
                 )
-
-            if max_steps is not None and global_step >= int(max_steps):
-                should_stop = True
-                break
-
-        # Cuối mỗi epoch: Ghi mẫu dịch & dọn cache
-        if not should_stop and eval_dataloader is not None:
-            metrics = evaluate_model(          # ← thêm block này
-                model=model,
-                eval_dataloader=eval_dataloader,
-                tokenizer=tokenizer,
-                device=active_device,
-                generation_kwargs=generation_kwargs,
-                ignore_index=ignore_index,
-            )
-            _wandb_log(wandb_run, metrics, step=global_step)
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-            _write_epoch_sample_translations(epoch + 1, model, eval_dataloader, tokenizer, output_dir, generation_kwargs)
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
 
     # --- 5. KẾT THÚC ---
     if eval_dataloader is not None and bool(_cfg(config, "run_eval_at_end", True)):
