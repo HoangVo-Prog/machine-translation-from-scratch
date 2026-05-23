@@ -1,664 +1,289 @@
-"""Training loop for machine translation with optional W&B tracking."""
+"""
+Trainer: handles training loop, evaluation, checkpointing, early stopping, W&B logging.
+"""
 
-from __future__ import annotations
-
-import copy
-import csv
-import logging
 import os
-from collections.abc import Mapping
-from contextlib import nullcontext
+import math
+import time
+import shutil
 from pathlib import Path
-import string
-from typing import Any
+from typing import Optional, Callable
 
 import torch
-from torch.amp import GradScaler, autocast
-from torch.nn.utils import clip_grad_norm_
+from tqdm import tqdm
+import sacrebleu
 
-try:
-    from .evaluate import evaluate_model
-    from .losses import maybe_compute_loss_from_outputs
-    from .optimizer import build_optimizer, build_scheduler
-except ImportError:  # pragma: no cover - fallback for direct script execution
-    from evaluate import evaluate_model
-    from losses import maybe_compute_loss_from_outputs
-    from optimizer import build_optimizer, build_scheduler
-
-LOGGER = logging.getLogger(__name__)
-_DEPENDENCY_INSTALL_HINT = "pip install sacrebleu rouge-score wandb python-dotenv"
-_DOTENV_LOADED = False
-_LABEL_KEYS = ("labels", "target_ids", "targets", "y")
-_REFERENCE_KEYS = ("references", "refs")
-_NON_MODEL_INPUT_KEYS = set(_LABEL_KEYS) | set(_REFERENCE_KEYS)
+from src.training.metrics import corpus_rouge_scores
+from src.training.loss import LabelSmoothedCrossEntropy
+from src.training.optimizers import build_optimizer, LinearWarmupDecayScheduler
+from src.utils.tensor_ops import clip_grad_norm_manual
 
 
-def get_secret(name: str, default: Any = None) -> Any:
-    """Read a secret from Kaggle if available; return default otherwise."""
-    try:
-        from kaggle_secrets import UserSecretsClient  # type: ignore
+class EarlyStopping:
+    def __init__(self, patience: int, mode: str = "max"):
+        self.patience = patience
+        self.mode = mode
+        self.best = -float("inf") if mode == "max" else float("inf")
+        self.counter = 0
 
-        value = UserSecretsClient().get_secret(name)
-        return default if value in (None, "") else value
-    except Exception:
-        return default
-
-
-def _load_dotenv_if_available() -> None:
-    global _DOTENV_LOADED
-    if _DOTENV_LOADED:
-        return
-    try:
-        from dotenv import load_dotenv
-
-        load_dotenv(override=False)
-        _DOTENV_LOADED = True
-    except ImportError:
-        LOGGER.warning("python-dotenv is not installed. Install with: %s", _DEPENDENCY_INSTALL_HINT)
-        _DOTENV_LOADED = True
+    def step(self, value: float) -> bool:
+        improved = (self.mode == "max" and value > self.best) or \
+                   (self.mode == "min" and value < self.best)
+        if improved:
+            self.best = value
+            self.counter = 0
+        else:
+            self.counter += 1
+        return self.counter >= self.patience   # True = stop
 
 
-def resolve_env_var(name: str, default: Any = None) -> Any:
-    """Resolve config/secret with priority: env > .env > Kaggle Secrets."""
-    current = os.getenv(name)
-    if current not in (None, ""):
-        return current
+class Trainer:
+    def __init__(
+        self,
+        model,
+        train_loader,
+        eval_loader,
+        tokenizer,
+        args,
+        device: torch.device,
+    ):
+        self.model = model
+        self.train_loader = train_loader
+        self.eval_loader = eval_loader
+        self.tokenizer = tokenizer
+        self.args = args
+        self.device = device
 
-    _load_dotenv_if_available()
-    from_dotenv = os.getenv(name)
-    if from_dotenv not in (None, ""):
-        return from_dotenv
-
-    from_secret = get_secret(name, default=None)
-    if from_secret not in (None, ""):
-        os.environ[name] = str(from_secret)
-        return from_secret
-    return default
-
-
-def _cfg(config: Any, key: str, default: Any) -> Any:
-    if isinstance(config, Mapping):
-        return config.get(key, default)
-    return getattr(config, key, default)
-
-
-def _config_to_dict(config: Any) -> dict[str, Any]:
-    if isinstance(config, Mapping):
-        return dict(config)
-    if hasattr(config, "__dict__"):
-        return dict(config.__dict__)
-    return {}
-
-
-def _move_to_device(batch: Any, device: torch.device) -> Any:
-    if torch.is_tensor(batch):
-        return batch.to(device)
-    if isinstance(batch, Mapping):
-        return {k: _move_to_device(v, device) for k, v in batch.items()}
-    if isinstance(batch, tuple):
-        return tuple(_move_to_device(x, device) for x in batch)
-    if isinstance(batch, list):
-        return [_move_to_device(x, device) for x in batch]
-    return batch
-
-
-def _extract_labels(batch: Any) -> torch.Tensor | None:
-    if isinstance(batch, Mapping):
-        for key in _LABEL_KEYS:
-            value = batch.get(key)
-            if torch.is_tensor(value):
-                return value
-        return None
-    if isinstance(batch, (tuple, list)) and len(batch) >= 2 and torch.is_tensor(batch[1]):
-        return batch[1]
-    return None
-
-
-def _forward_model(model: torch.nn.Module, batch: Any) -> Any:
-    if isinstance(batch, Mapping):
-        model_inputs = {k: v for k, v in batch.items() if k not in _NON_MODEL_INPUT_KEYS}
-        return model(**model_inputs)
-    if isinstance(batch, (tuple, list)):
-        # Dataset trả về (src, tgt, src_mask, tgt_mask) — chỉ cần src và tgt
-        if len(batch) >= 2 and torch.is_tensor(batch[0]) and torch.is_tensor(batch[1]):
-            return model(batch[0], batch[1])  # ← chỉ truyền src, tgt
-        if len(batch) == 1:
-            return model(batch[0])
-        raise ValueError(f"Unsupported batch format: {type(batch)}")
-    return model(batch)
-
-
-def _init_wandb(config: Any, output_dir: Path) -> Any | None:
-    enabled = bool(_cfg(config, "wandb_enabled", True))
-    if not enabled:
-        return None
-
-    try:
-        import wandb
-    except ImportError:
-        LOGGER.warning("wandb is not installed. Install with: %s. Continuing with W&B disabled.", _DEPENDENCY_INSTALL_HINT)
-        return None
-
-    api_key = resolve_env_var("WANDB_API_KEY", default=None)
-    mode = str(_cfg(config, "wandb_mode", "online")).lower()
-    if mode not in {"online", "offline", "disabled"}:
-        mode = "online"
-
-    if not api_key and mode == "online":
-        LOGGER.warning("WANDB_API_KEY not found in env/.env/Kaggle; disabling W&B to avoid failure.")
-        mode = "disabled"
-
-    if api_key:
-        try:
-            wandb.login(key=api_key, relogin=False)
-        except Exception as exc:
-            LOGGER.warning("wandb login failed (%s). Falling back to disabled mode.", exc)
-            mode = "disabled"
-
-    if mode == "disabled":
-        return None
-
-    run_id = _cfg(config, "wandb_id", None)
-    resume_enabled = bool(_cfg(config, "wandb_resume", False))
-    checkpoint_resume = _cfg(config, "resume_from_checkpoint", None) is not None
-    wandb_id_file = output_dir / "wandb_run_id.txt"
-    if run_id is None and (resume_enabled or checkpoint_resume) and wandb_id_file.exists():
-        try:
-            restored_id = wandb_id_file.read_text(encoding="utf-8").strip()
-            if restored_id:
-                run_id = restored_id
-                resume_enabled = True
-        except OSError:
-            pass
-
-    init_kwargs: dict[str, Any] = {
-        "project": _cfg(config, "wandb_project", "machine-translation"),
-        "entity": _cfg(config, "wandb_entity", None),
-        "name": _cfg(config, "wandb_run_name", None),
-        "group": _cfg(config, "wandb_group", None),
-        "tags": _cfg(config, "wandb_tags", None),
-        "mode": mode,
-        "config": _config_to_dict(config),
-    }
-    if run_id is not None:
-        init_kwargs["id"] = run_id
-    if resume_enabled:
-        init_kwargs["resume"] = "allow"
-
-    try:
-        wandb_run = wandb.init(**init_kwargs)
-        if wandb_run is not None:
-            try:
-                wandb_run_id = getattr(wandb_run, "id", None)
-                if wandb_run_id is not None:
-                    output_dir.mkdir(parents=True, exist_ok=True)
-                    wandb_id_file.write_text(str(wandb_run_id), encoding="utf-8")
-            except Exception:
-                pass
-        return wandb_run
-    except Exception as exc:
-        LOGGER.warning("wandb init failed (%s). Continuing with W&B disabled.", exc)
-        return None
-
-
-def _wandb_log(wandb_run: Any | None, data: dict[str, Any], step: int | None = None) -> None:
-    if wandb_run is None:
-        return
-    try:
-        wandb_run.log(data, step=step)
-    except Exception as exc:
-        LOGGER.warning("Failed to log to W&B: %s", exc)
-
-
-def _save_checkpoint(
-    model: torch.nn.Module,
-    optimizer: torch.optim.Optimizer,
-    scheduler: Any,
-    scaler: GradScaler | None,
-    output_dir: Path,
-    name: str,
-    tokenizer: Any | None = None,
-    extra_state: dict[str, Any] | None = None,
-) -> str:
-    checkpoint_dir = output_dir / name
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
-    model_format = "state_dict"
-    if hasattr(model, "save_pretrained"):
-        model.save_pretrained(str(checkpoint_dir))
-        model_format = "pretrained"
-    torch.save(model.state_dict(), checkpoint_dir / "model.pt")
-
-    if tokenizer is not None and hasattr(tokenizer, "save_pretrained"):
-        tokenizer.save_pretrained(str(checkpoint_dir))
-
-    state = {
-        "optimizer": optimizer.state_dict(),
-        "scheduler": scheduler.state_dict() if scheduler is not None else None,
-        "scaler": scaler.state_dict() if scaler is not None else None,
-        "model_format": model_format,
-    }
-    if extra_state:
-        state.update(extra_state)
-    torch.save(state, checkpoint_dir / "training_state.pt")
-    return str(checkpoint_dir)
-
-
-def _load_checkpoint(
-    checkpoint_dir: Path,
-    model: torch.nn.Module,
-    optimizer: torch.optim.Optimizer,
-    scheduler: Any,
-    scaler: GradScaler | None,
-) -> dict[str, Any]:
-    if not checkpoint_dir.exists():
-        raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir}")
-
-    training_state = torch.load(checkpoint_dir / "training_state.pt", map_location="cpu")
-    model_path = checkpoint_dir / "model.pt"
-    model_format = training_state.get("model_format")
-
-    if model_path.exists():
-        state_dict = torch.load(model_path, map_location="cpu")
-        model.load_state_dict(state_dict)
-    elif model_format == "pretrained" and hasattr(model.__class__, "from_pretrained"):
-        restored_model = model.__class__.from_pretrained(str(checkpoint_dir))
-        model.load_state_dict(restored_model.state_dict())
-    else:
-        raise FileNotFoundError(
-            f"Model checkpoint not found in {checkpoint_dir}. "
-            "Expected model.pt or compatible pretrained weights."
+        self.criterion = LabelSmoothedCrossEntropy(
+            label_smoothing=args.label_smoothing,
+            ignore_index=tokenizer.tgt.pad_idx,
         )
-    optimizer.load_state_dict(training_state["optimizer"])
 
-    if scheduler is not None and training_state.get("scheduler") is not None:
-        scheduler.load_state_dict(training_state["scheduler"])
+        # Optimizer
+        self.optimizer = build_optimizer(
+            optimizer_type=args.optimizer_type,
+            params=model.parameters(),
+            learning_rate=args.learning_rate,
+        )
 
-    if scaler is not None and training_state.get("scaler") is not None:
-        scaler.load_state_dict(training_state["scaler"])
+        # LR scheduler: linear warmup then linear decay
+        total_steps = len(train_loader) * args.num_epochs // args.gradient_accumulation_steps
+        warmup_steps = int(total_steps * args.warmup_ratio)
+        self.scheduler = self._build_scheduler(total_steps, warmup_steps)
 
-    return {
-        "epoch": int(training_state.get("epoch", 0)),
-        "global_step": int(training_state.get("global_step", 0)),
-        "best_metric": training_state.get("best_metric", None),
-    }
+        self.global_step = 0
+        self.best_metric = -float("inf")
+        self.best_ckpt_path: Optional[str] = None
+        self.start_epoch = 1
 
+        self.early_stopping = EarlyStopping(patience=args.early_stopping_patience, mode="max")
 
-def _compute_total_training_steps(
-    train_dataloader: Any, num_epochs: int, grad_accum_steps: int, max_steps: int | None
-) -> int:
-    if max_steps is not None and max_steps > 0:
-        return int(max_steps)
-    if not hasattr(train_dataloader, "__len__"):
-        raise ValueError("train_dataloader must define __len__ if max_steps is not provided.")
-    steps_per_epoch = max(1, len(train_dataloader) // max(1, grad_accum_steps))
-    return steps_per_epoch * max(1, num_epochs)
+        # Resume from checkpoint if provided
+        resume_path = getattr(args, "resume_from_checkpoint", None)
+        if resume_path:
+            self._load_checkpoint(resume_path)
 
+        # W&B
+        self.wandb_run = None
+        if args.wandb_enabled:
+            self._init_wandb()
 
-def _decode_predictions(
-    tokenizer: Any,
-    sequences: Any,
-    ignore_index: int = -100,
-    vocab: Any | None = None,
-) -> list[str]:
-    if torch.is_tensor(sequences):
-        sequences = sequences.detach().cpu().tolist()
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def train(self):
+        output_dir = Path(self.args.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-    if sequences is None:
-        return []
+        for epoch in range(self.start_epoch, self.args.num_epochs + 1):
+            train_loss = self._train_epoch(epoch)
+            eval_metrics = self._evaluate()
 
-    if tokenizer is not None and hasattr(tokenizer, "batch_decode"):
-        cleaned = [
-            [int(tok) for tok in seq if int(tok) != ignore_index]
-            for seq in sequences
-        ]
-        return tokenizer.batch_decode(cleaned, skip_special_tokens=True)
+            bleu = eval_metrics["eval/bleu"]
+            rouge1 = eval_metrics["eval/rouge1"]
+            rouge2 = eval_metrics["eval/rouge2"]
+            rouge_l = eval_metrics["eval/rougeL"]
+            print(
+                f"Epoch {epoch:3d} | train_loss={train_loss:.4f} | "
+                f"eval_loss={eval_metrics['eval/loss']:.4f} | BLEU={bleu:.2f} | "
+                f"ROUGE-1={rouge1:.2f} ROUGE-2={rouge2:.2f} ROUGE-L={rouge_l:.2f}"
+            )
 
-    if vocab is not None:
-        itos = getattr(vocab, "itos", None)
-        if itos is None:
-            itos = getattr(vocab, "id_to_token", None)
-        if itos is None:
-            itos = getattr(vocab, "idx_to_token", None)
+            # Save best
+            target_metric = eval_metrics.get(self.args.metric_for_best_model, bleu)
+            if target_metric > self.best_metric:
+                self.best_metric = target_metric
+                best_path = output_dir / "best_model.pt"
+                self._save_checkpoint(str(best_path), epoch, eval_metrics)
+                print(f"  ✓ New best model saved (metric={target_metric:.4f})")
 
-        if itos is not None:
-            decoded = []
-            special_tokens = {"<pad>", "<sos>", "<bos>", "<eos>", "<unk>"}
+            # Always save latest checkpoint for resuming
+            last_path = output_dir / "last_checkpoint.pt"
+            self._save_checkpoint(str(last_path), epoch, eval_metrics)
 
-            for seq in sequences:
-                tokens = []
-                for tok in seq:
-                    tok = int(tok)
-                    if tok == ignore_index:
-                        continue
+            # Early stopping
+            if self.early_stopping.step(target_metric):
+                print(f"Early stopping triggered after epoch {epoch}.")
+                break
 
-                    if isinstance(itos, dict):
-                        token = itos.get(tok, "")
-                    else:
-                        token = itos[tok] if 0 <= tok < len(itos) else ""
+        print(f"\nTraining complete. Best {self.args.metric_for_best_model}={self.best_metric:.4f}")
+        if self.wandb_run:
+            self.wandb_run.finish()
 
-                    if token in special_tokens:
-                        continue
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+    def _load_checkpoint(self, path: str):
+        print(f"Resuming from checkpoint: {path}")
+        ckpt = torch.load(path, map_location=self.device)
 
-                    tokens.append(token)
+        self.model.load_state_dict(ckpt["model_state_dict"])
+        self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        self.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        self.global_step = ckpt["global_step"]
+        self.start_epoch = ckpt["epoch"] + 1
+        self.best_metric = ckpt["metrics"].get(
+            self.args.metric_for_best_model, -float("inf")
+        )
 
-                decoded.append(" ".join(tokens))
+        # Restore early stopping state
+        self.early_stopping.best = self.best_metric
 
-            return decoded
+        print(
+            f"  Resumed at epoch {self.start_epoch} | "
+            f"global_step={self.global_step} | "
+            f"best_metric={self.best_metric:.4f}"
+        )
 
-    if isinstance(sequences, (tuple, list)) and sequences and not isinstance(sequences[0], str):
-        return [
-            " ".join(str(int(tok)) for tok in seq if int(tok) != ignore_index)
-            for seq in sequences
-        ]
+    def _train_epoch(self, epoch: int) -> float:
+        self.model.train()
+        total_loss = 0.0
+        self.optimizer.zero_grad()
 
-    return [str(sequences)]
+        pbar = tqdm(self.train_loader, desc=f"Epoch {epoch}", leave=False)
+        for step, (src, tgt, src_lengths) in enumerate(pbar):
+            src = src.to(self.device)
+            tgt = tgt.to(self.device)
+            src_lengths = src_lengths.to(self.device)
 
+            logits = self.model(src, src_lengths, tgt, teacher_forcing_ratio=1.0)
+            # logits: (batch, tgt_len-1, vocab)
+            # tgt:    (batch, tgt_len)  -> targets are tgt[:, 1:]
+            loss = self.criterion(
+                logits.reshape(-1, logits.size(-1)),
+                tgt[:, 1:].reshape(-1),
+            )
+            (loss / self.args.gradient_accumulation_steps).backward()
+            total_loss += loss.item()
 
-def _append_translation_samples(csv_path: Path, rows: list[list[Any]]) -> None:
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
-    file_exists = csv_path.exists()
-    with csv_path.open("a", newline="", encoding="utf-8") as csvfile:
-        writer = csv.writer(csvfile)
-        if not file_exists:
-            writer.writerow(["epoch", "source", "reference", "prediction"])
-        writer.writerows(rows)
+            if (step + 1) % self.args.gradient_accumulation_steps == 0:
+                clip_grad_norm_manual(self.model.parameters(), self.args.max_grad_norm)
+                self.optimizer.step()
+                self.scheduler.step()
+                self.optimizer.zero_grad()
+                self.global_step += 1
 
+                if self.global_step % self.args.logging_steps == 0:
+                    avg = total_loss / (step + 1)
+                    pbar.set_postfix(loss=f"{avg:.4f}", lr=f"{self.scheduler.get_last_lr()[0]:.2e}")
 
-def _get_fixed_eval_samples(eval_dataloader, num_samples=5):
-    dataset = getattr(eval_dataloader, "dataset", None)
-    if dataset is None:
-        return [], None, None
+                if self.wandb_run and self.global_step % self.args.wandb_log_steps == 0:
+                    avg = total_loss / (step + 1)
+                    self.wandb_run.log(
+                        {"train/loss": avg, "train/lr": self.scheduler.get_last_lr()[0]},
+                        step=self.global_step,
+                    )
 
-    # Guard: kiểm tra attribute tồn tại
-    if not hasattr(dataset, "src_texts") or not hasattr(dataset, "trg_texts"):
-        LOGGER.warning("Dataset thiếu src_texts/trg_texts, bỏ qua sample logging.")
-        return [], None, None
+                if self.args.save_steps > 0 and self.global_step % self.args.save_steps == 0:
+                    ckpt_path = Path(self.args.output_dir) / f"checkpoint-{self.global_step}.pt"
+                    self._save_checkpoint(str(ckpt_path), epoch, {})
 
-    total = min(num_samples, len(dataset))
-    if total == 0:
-        return [], None, None
+        return total_loss / len(self.train_loader)
 
-    raw_pairs = [(dataset.src_texts[i], dataset.trg_texts[i]) for i in range(total)]
-    batch = None
+    @torch.no_grad()
+    def _evaluate(self) -> dict:
+        self.model.eval()
+        total_loss = 0.0
+        hypotheses, references = [], []
+        display_samples = []
 
-    if hasattr(eval_dataloader, "collate_fn"):
-        batch = eval_dataloader.collate_fn([dataset[i] for i in range(total)])
+        for src, tgt, src_lengths in tqdm(self.eval_loader, desc="Evaluating", leave=False):
+            src = src.to(self.device)
+            tgt = tgt.to(self.device)
+            src_lengths = src_lengths.to(self.device)
 
-    if isinstance(batch, (tuple, list)) and len(batch) >= 2:
-        return raw_pairs, batch[0], batch[1]
+            # Loss
+            logits = self.model(src, src_lengths, tgt, teacher_forcing_ratio=1.0)
+            loss = self.criterion(
+                logits.reshape(-1, logits.size(-1)),
+                tgt[:, 1:].reshape(-1),
+            )
+            total_loss += loss.item()
 
-    samples = [dataset[i] for i in range(total)]
-    if not samples:
-        return [], None, None
+            # BLEU: beam search decode
+            best_seqs = self.model.beam_search(
+                src, src_lengths, num_beams=self.args.num_beams
+            )
+            for seq, src_ids, ref_ids in zip(best_seqs, src.tolist(), tgt.tolist()):
+                src_text = self.tokenizer.src.decode(src_ids)
+                hyp = self.tokenizer.tgt.decode(seq)
+                ref = self.tokenizer.tgt.decode(ref_ids)
+                hypotheses.append(hyp)
+                references.append([ref])
+                if len(display_samples) < 3:
+                    display_samples.append((src_text, ref, hyp))
 
-    src_batch = torch.stack([item[0] for item in samples])
-    tgt_batch = torch.stack([item[1] for item in samples])
-    return raw_pairs, src_batch, tgt_batch
+        bleu = sacrebleu.corpus_bleu(hypotheses, references).score
+        rouge_scores = corpus_rouge_scores(hypotheses, references)
+        avg_loss = total_loss / len(self.eval_loader)
 
+        # Print translation samples
+        src_lang, tgt_lang = self.args.direction.split("2")
+        print(f"\n  Translation samples:")
+        for src_text, ref, hyp in display_samples:
+            print(f"  [{src_lang}] {src_text}")
+            print(f"  [{tgt_lang}] {ref}")
+            print(f"  [pred] {hyp}")
+            print()
 
-def _write_epoch_sample_translations(
-    epoch: int,
-    model: torch.nn.Module,
-    eval_dataloader: Any,
-    tokenizer: Any | None,
-    output_dir: Path,
-    generation_kwargs: dict[str, Any],
-    num_samples: int = 5,
-) -> None:
-    # Lấy mẫu cố định để đánh giá
-    raw_pairs, src_batch, _ = _get_fixed_eval_samples(eval_dataloader, num_samples=num_samples)
-    if not raw_pairs or src_batch is None:
-        return
+        metrics = {
+            "eval/loss": avg_loss,
+            "eval/bleu": bleu,
+            "eval/rouge1": rouge_scores["rouge1"],
+            "eval/rouge2": rouge_scores["rouge2"],
+            "eval/rougeL": rouge_scores["rougeL"],
+        }
+        if self.wandb_run:
+            self.wandb_run.log(metrics, step=self.global_step)
+        return metrics
 
-    model.eval()
-    device = next(model.parameters()).device # Lấy device hiện tại của model
+    def _save_checkpoint(self, path: str, epoch: int, metrics: dict):
+        torch.save(
+            {
+                "epoch": epoch,
+                "global_step": self.global_step,
+                "model_state_dict": self.model.state_dict(),
+                "optimizer_state_dict": self.optimizer.state_dict(),
+                "scheduler_state_dict": self.scheduler.state_dict(),
+                "metrics": metrics,
+                "args": vars(self.args),
+            },
+            path,
+        )
 
-    with torch.no_grad():
-        # Chuyển src_batch lên đúng device của model
-        src_batch = src_batch.to(device)
-        
-        dataset = getattr(eval_dataloader, "dataset", None)
-        bos_token_id = None
-        if dataset is not None and hasattr(dataset, "vocab_trg"):
-            bos_token_id = dataset.vocab_trg.stoi.get("<sos>")
-        if bos_token_id is None:
-            bos_token_id = 1
+    def _build_scheduler(self, total_steps: int, warmup_steps: int) -> LinearWarmupDecayScheduler:
+        return LinearWarmupDecayScheduler(self.optimizer, total_steps, warmup_steps)
 
-        # Kiểm soát max_length để tránh tràn bộ nhớ nếu câu đầu vào quá dài
-        max_length = int(generation_kwargs.get("max_length", max(50, src_batch.shape[1] + 20)))
-        
+    def _init_wandb(self):
         try:
-            # Giải mã bằng phương pháp Greedy Search
-            pred_tokens = model.greedy_decode(
-                src_batch,
-                bos_token_id=bos_token_id,
-                src_lengths=None,
-                max_length=max_length,
+            import wandb
+
+            resume = "allow" if self.args.wandb_resume else "never"
+            self.wandb_run = wandb.init(
+                project=self.args.wandb_project,
+                name=self.args.wandb_run_name,
+                resume=resume,
+                config=vars(self.args),
             )
-        except Exception:
-            LOGGER.warning("Epoch %s: unable to generate translation samples; skipping sample logging.", epoch)
-            del src_batch
-            torch.cuda.empty_cache()
-            return
-
-    dataset = getattr(eval_dataloader, "dataset", None)
-    vocab_trg = getattr(dataset, "vocab_trg", None) if dataset is not None else None
-
-    sources = [src for src, _ in raw_pairs]
-    decoded_refs = [ref for _, ref in raw_pairs]
-    predictions = _decode_predictions(tokenizer, pred_tokens, vocab=vocab_trg)
-
-    # Log và ghi CSV
-    rows: list[list[Any]] = []
-    LOGGER.info("epoch=%s translation samples:", epoch)
-    for index, (source, reference, prediction) in enumerate(zip(sources, decoded_refs, predictions), start=1):
-        LOGGER.info("epoch=%s sample=%s src=%s", epoch, index, source)
-        LOGGER.info("epoch=%s sample=%s ref=%s", epoch, index, reference)
-        LOGGER.info("epoch=%s sample=%s pred=%s", epoch, index, prediction)
-        rows.append([epoch, source, reference, prediction])
-
-    # Ghi kết quả vào file CSV
-    csv_path = output_dir / "translation_samples.csv"
-    _append_translation_samples(csv_path, rows)
-
-    # Giải phóng hoàn toàn các tensor lớn và dọn cache GPU sau khi hoàn tất log
-    del src_batch, pred_tokens
-    torch.cuda.empty_cache()
-
-
-def train(
-    model: torch.nn.Module,
-    train_dataloader: Any,
-    eval_dataloader: Any | None = None,
-    config: Any | None = None,
-    tokenizer: Any | None = None,
-    device: torch.device | str | None = None,
-) -> dict[str, Any]:
-    """Huấn luyện mô hình MT với các tính năng: Eval định kỳ, Checkpoint, AMP và Early Stopping."""
-    
-    # --- 1. CẤU HÌNH BAN ĐẦU ---
-    config = config or {}
-    output_dir = Path(_cfg(config, "output_dir", "checkpoints"))
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    active_device = torch.device(device) if device is not None else torch.device(
-        "cuda" if torch.cuda.is_available() else "cpu"
-    )
-    model = model.to(active_device)
-
-    # Đọc các tham số từ config
-    num_epochs = int(_cfg(config, "num_epochs", _cfg(config, "epochs", 1)))
-    max_steps = _cfg(config, "max_steps", None)
-    grad_accum_steps = int(_cfg(config, "gradient_accumulation_steps", 1))
-    logging_steps = int(_cfg(config, "logging_steps", 100))
-    eval_steps = _cfg(config, "eval_steps", None)
-    save_steps = _cfg(config, "save_steps", None)
-    ignore_index = int(_cfg(config, "ignore_index", 0))
-    label_smoothing = float(_cfg(config, "label_smoothing", 0.0))
-    max_grad_norm = float(_cfg(config, "max_grad_norm", 1.0))
-    metric_for_best = str(_cfg(config, "metric_for_best_model", "eval/bleu"))
-    greater_is_better = bool(_cfg(config, "greater_is_better", True))
-    early_stopping_patience = _cfg(config, "early_stopping_patience", None)
-    generation_kwargs = copy.deepcopy(_cfg(config, "generation_kwargs", {}))
-
-    # --- 2. OPTIMIZER, SCHEDULER & AMP ---
-    total_steps = _compute_total_training_steps(train_dataloader, num_epochs, grad_accum_steps, max_steps)
-    optimizer = build_optimizer(model, config)
-    scheduler = build_scheduler(optimizer, config, total_steps)
-
-    use_amp = bool(_cfg(config, "mixed_precision", False)) and active_device.type == "cuda"
-    scaler = GradScaler() if use_amp else None
-
-    # --- 3. RESUME CHECKPOINT ---
-    start_epoch = 0
-    global_step = 0
-    best_metric = float("-inf") if greater_is_better else float("inf")
-    resume_checkpoint = _cfg(config, "resume_from_checkpoint", None)
-    
-    if resume_checkpoint is not None:
-        resume_state = _load_checkpoint(Path(resume_checkpoint), model, optimizer, scheduler, scaler)
-        start_epoch = min(resume_state.get("epoch", 0) + 1, num_epochs)
-        global_step = resume_state.get("global_step", 0)
-        best_metric = float(resume_state.get("best_metric", best_metric))
-
-    wandb_run = _init_wandb(config, output_dir)
-    best_checkpoint = None
-    early_stopping_counter = 0
-    should_stop = False  # Cờ để dừng toàn bộ training
-    current_epoch = start_epoch
-
-    optimizer.zero_grad(set_to_none=True)
-
-    # --- 4. VÒNG LẶP HUẤN LUYỆN CHÍNH ---
-    for epoch in range(start_epoch, num_epochs):
-        if should_stop:
-            break
-            
-        current_epoch = epoch
-        model.train()
-        
-        for step, batch in enumerate(train_dataloader, start=1):
-            # Di chuyển dữ liệu lên GPU
-            batch = _move_to_device(batch, active_device)
-            labels = _extract_labels(batch)
-
-            # Forward pass với Mixed Precision
-            autocast_context = autocast(device_type=active_device.type) if use_amp else nullcontext()
-            with autocast_context:
-                outputs = _forward_model(model, batch)
-                loss, loss_logs = maybe_compute_loss_from_outputs(
-                    outputs=outputs, labels=labels,
-                    label_smoothing=label_smoothing, ignore_index=ignore_index,
-                )
-
-            # Backward pass
-            scaled_loss = loss / max(1, grad_accum_steps)
-            if scaler is not None:
-                scaler.scale(scaled_loss).backward()
-            else:
-                scaled_loss.backward()
-
-            # Giải phóng tensor trung gian ngay lập tức để tránh OOM
-            del outputs, loss, scaled_loss 
-
-            if step % grad_accum_steps != 0:
-                continue
-
-            # Optimizer Step (Gradient Clipping & Update)
-            if max_grad_norm > 0:
-                if scaler is not None: scaler.unscale_(optimizer)
-                clip_grad_norm_(model.parameters(), max_grad_norm)
-
-            if scaler is not None:
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                optimizer.step()
-            
-            # Xóa gradient nhanh (set_to_none=True)
-            optimizer.zero_grad(set_to_none=True)
-            if scheduler is not None:
-                scheduler.step()
-
-            global_step += 1
-            del batch, labels # Xóa dữ liệu batch sau khi xong
-
-            # Logging & Eval
-            train_logs = {**loss_logs, "train/lr": float(optimizer.param_groups[0]["lr"])}
-            if global_step % logging_steps == 0:
-                LOGGER.info(f"Step {global_step} | Loss: {loss_logs.get('train/loss_total', 0):.4f}")
-            if wandb_run and global_step % _cfg(config, "wandb_log_steps", 100) == 0:
-                _wandb_log(wandb_run, train_logs, step=global_step)
-
-            # --- ĐÁNH GIÁ (EVALUATION) ---
-            if eval_dataloader is not None and eval_steps and global_step % int(eval_steps) == 0:
-                metrics = evaluate_model(
-                    model=model, eval_dataloader=eval_dataloader, tokenizer=tokenizer,
-                    device=active_device, generation_kwargs=generation_kwargs, ignore_index=ignore_index,
-                )
-                _wandb_log(wandb_run, metrics, step=global_step)
-
-                # Quan trọng: Dọn dẹp cache sau Eval nặng
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-
-                # Kiểm tra Early Stopping
-                current_metric = float(metrics.get(metric_for_best, float("nan")))
-                if not torch.isnan(torch.tensor(current_metric)):
-                    improved = current_metric > best_metric if greater_is_better else current_metric < best_metric
-                    if improved:
-                        best_metric = current_metric
-                        early_stopping_counter = 0
-                        best_checkpoint = _save_checkpoint(
-                            model=model, optimizer=optimizer, scheduler=scheduler,
-                            scaler=scaler, output_dir=output_dir, name="best",
-                            tokenizer=tokenizer, extra_state={"epoch": epoch, "global_step": global_step, "best_metric": best_metric}
-                        )
-                    else:
-                        early_stopping_counter += 1
-                        if early_stopping_patience and early_stopping_counter >= early_stopping_patience:
-                            LOGGER.info("Early stopping triggered!")
-                            should_stop = True
-                            break
-
-            # Lưu checkpoint định kỳ
-            if save_steps and global_step % int(save_steps) == 0:
-                _save_checkpoint(
-                    model=model, optimizer=optimizer, scheduler=scheduler,
-                    scaler=scaler, output_dir=output_dir, name=f"step_{global_step}",
-                    tokenizer=tokenizer, extra_state={"epoch": epoch, "global_step": global_step}
-                )
-
-        # Ghi mẫu dịch sau mỗi epoch
-        if not should_stop and eval_dataloader is not None:
-            _write_epoch_sample_translations(
-                epoch + 1,
-                model,
-                eval_dataloader,
-                tokenizer,
-                output_dir,
-                generation_kwargs,
-            )
-
-
-    # --- 5. KẾT THÚC ---
-    if eval_dataloader is not None and bool(_cfg(config, "run_eval_at_end", True)):
-        final_metrics = evaluate_model(model, eval_dataloader, tokenizer, active_device, generation_kwargs, ignore_index)
-        _wandb_log(wandb_run, final_metrics, step=global_step)
-
-    last_checkpoint = _save_checkpoint(
-        model=model, optimizer=optimizer, scheduler=scheduler, scaler=scaler,
-        output_dir=output_dir, name="last", tokenizer=tokenizer,
-        extra_state={"epoch": current_epoch, "global_step": global_step, "best_metric": best_metric},
-    )
-
-    if wandb_run:
-        wandb_run.finish()
-
-    return {
-        "global_step": global_step,
-        "best_metric": best_metric,
-        "best_checkpoint": best_checkpoint,
-        "last_checkpoint": last_checkpoint,
-    }
+        except ImportError:
+            print("wandb not installed — skipping W&B logging.")

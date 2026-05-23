@@ -1,214 +1,145 @@
-"""CLI command for machine translation training."""
+"""
+CLI entry point for training.
 
-from __future__ import annotations
+Usage:
+    python -m src.cli.train \
+        --model_factory src.factories:build_model \
+        --train_dataloader_factory src.factories:build_train_dataloader \
+        --eval_dataloader_factory src.factories:build_eval_dataloader \
+        --tokenizer_factory src.factories:build_tokenizer \
+        ...
+"""
 
 import argparse
-import importlib
-import inspect
-import json
-import logging
-from pathlib import Path
-from typing import Any
+import sys
+
+import torch
+
+from src.utils.misc import import_from_string, set_seed, count_parameters, get_device
+from src.training.trainer import Trainer
 
 
-def _load_callable(path: str):
-    if ":" not in path:
-        raise ValueError(f"Invalid callable path '{path}'. Use format: module.submodule:function_name")
-    module_name, fn_name = path.split(":", 1)
-    module = importlib.import_module(module_name)
-    fn = getattr(module, fn_name, None)
-    if fn is None or not callable(fn):
-        raise ValueError(f"'{fn_name}' in module '{module_name}' is not callable.")
-    return fn
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train a Seq2Seq MT model")
+
+    # Factory dotted paths
+    parser.add_argument("--model_factory", required=True)
+    parser.add_argument("--train_dataloader_factory", required=True)
+    parser.add_argument("--eval_dataloader_factory", required=True)
+    parser.add_argument("--tokenizer_factory", required=True)
+
+    # Data
+    parser.add_argument("--train_file", required=True)
+    parser.add_argument("--eval_file", required=True)
+    parser.add_argument("--direction", default="en2vi", help="e.g. en2vi or vi2en")
+    parser.add_argument("--tokenizer_cache_dir", default="checkpoints/tokenizers")
+    parser.add_argument("--tokenizer_backend", default="bpe", choices=["bpe"])
+    parser.add_argument("--max_src_len", type=int, default=150)
+    parser.add_argument("--max_tgt_len", type=int, default=150)
+    parser.add_argument("--vocab_size", type=int, default=8000)
+    parser.add_argument("--shared_vocab", type=lambda x: x.lower() == "true", default=True)
+
+    # Model architecture
+    parser.add_argument("--embed_dim", type=int, default=256)
+    parser.add_argument("--hidden_size", type=int, default=512)
+    parser.add_argument("--num_layers", type=int, default=3)
+    parser.add_argument("--cell_type", default="lstm", choices=["rnn", "gru", "lstm"])
+    parser.add_argument(
+        "--attention_type",
+        default="luong",
+        type=lambda x: x.lower(),
+        choices=["none", "bahdanau", "luong"],
+    )
+    parser.add_argument(
+        "--bidirectional",
+        type=lambda x: x.lower() == "true",
+        default=True,
+    )
+    parser.add_argument("--dropout", type=float, default=0.1)
+
+    # Training hyper-params
+    parser.add_argument("--output_dir", default="checkpoints")
+    parser.add_argument("--num_epochs", type=int, default=50)
+    parser.add_argument("--learning_rate", type=float, default=1e-3)
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
+    parser.add_argument("--label_smoothing", type=float, default=0.1)
+    parser.add_argument("--warmup_ratio", type=float, default=0.1)
+    parser.add_argument("--max_grad_norm", type=float, default=1.0)
+    parser.add_argument("--metric_for_best_model", default="eval/bleu")
+    parser.add_argument("--num_beams", type=int, default=5)
+    parser.add_argument("--optimizer_type", default="adam", choices=["adam", "adamw", "sgd"])
+    parser.add_argument("--early_stopping_patience", type=int, default=12)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument("--resume_from_checkpoint", default=None)
+
+    # Logging & checkpointing
+    parser.add_argument("--save_steps", type=int, default=1000)
+    parser.add_argument("--eval_steps", type=int, default=1000)
+    parser.add_argument("--logging_steps", type=int, default=500)
+
+    # W&B
+    parser.add_argument("--wandb_log_steps", type=int, default=500)
+    parser.add_argument("--wandb_enabled", type=lambda x: x.lower() == "true", default=False)
+    parser.add_argument("--wandb_resume", type=lambda x: x.lower() == "true", default=False)
+    parser.add_argument("--wandb_project", default="mt-project")
+    parser.add_argument("--wandb_run_name", default=None)
+
+    return parser.parse_args()
 
 
-def _call_factory(fn, config: dict[str, Any]):
-    try:
-        sig = inspect.signature(fn)
-    except ValueError:
-        return fn(config)
+def main():
+    args = parse_args()
+    set_seed(args.seed)
+    device = get_device()
 
-    if len(sig.parameters) >= 1:
-        return fn(config)
+    print(f"Device: {device}")
+    print(f"Direction: {args.direction}")
 
-    return fn()
-
-
-def _parse_config_value(value: str) -> Any:
-    value = value.strip()
-    lowered = value.lower()
-    if lowered in {"true", "false"}:
-        return lowered == "true"
-    if lowered in {"none", "null"}:
-        return None
-    try:
-        if "." in value:
-            return float(value)
-        return int(value)
-    except ValueError:
-        return value
-
-
-def _parse_overrides(overrides: list[str]) -> dict[str, Any]:
-    config = {}
-    for item in overrides:
-        if "=" not in item:
-            raise ValueError(f"Invalid --set value '{item}'. Use key=value.")
-        key, val = item.split("=", 1)
-        config[key.strip()] = _parse_config_value(val)
-    return config
-
-
-def _load_json_config(path: str | None) -> dict[str, Any]:
-    if not path:
-        return {}
-    cfg_path = Path(path)
-    if not cfg_path.exists():
-        raise FileNotFoundError(f"Config file not found: {cfg_path}")
-    with cfg_path.open("r", encoding="utf-8") as f:
-        data = json.load(f)
-    if not isinstance(data, dict):
-        raise ValueError("Config JSON must be an object/dict.")
-    return data
-
-
-def _read_bool_like(value: str | None) -> bool | None:
-    if value is None:
-        return None
-    lowered = value.lower()
-    if lowered in {"1", "true", "yes", "y", "on"}:
-        return True
-    if lowered in {"0", "false", "no", "n", "off"}:
-        return False
-    raise ValueError(f"Invalid boolean value: {value}")
-
-
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train MT model.")
-
-    parser.add_argument("--model_factory", type=str, required=True)
-    parser.add_argument("--train_dataloader_factory", type=str, required=True)
-    parser.add_argument("--eval_dataloader_factory", type=str, default=None)
-    parser.add_argument("--tokenizer_factory", type=str, default=None)
-    parser.add_argument("--config_json", type=str, default=None)
-    parser.add_argument("--set", dest="overrides", nargs="*", default=[])
-
-    parser.add_argument("--train_file", type=str, default=None)
-    parser.add_argument("--eval_file", type=str, default=None)
-    parser.add_argument("--output_dir", type=str, default=None)
-    parser.add_argument("--num_epochs", type=int, default=None)
-    parser.add_argument("--learning_rate", type=float, default=None)
-    parser.add_argument("--batch_size", type=int, default=None)
-    parser.add_argument("--eval_batch_size", type=int, default=None)
-    parser.add_argument("--weight_decay", type=float, default=None)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=None)
-    parser.add_argument("--label_smoothing", type=float, default=None)
-    parser.add_argument("--warmup_steps", type=int, default=None)
-    parser.add_argument("--warmup_ratio", type=float, default=None)
-    parser.add_argument("--scheduler_type", type=str, default=None)
-    parser.add_argument("--max_grad_norm", type=float, default=None)
-    parser.add_argument("--mixed_precision", type=str, default=None)
-    parser.add_argument("--eval_steps", type=int, default=None)
-    parser.add_argument("--save_steps", type=int, default=None)
-    parser.add_argument("--logging_steps", type=int, default=None)
-    parser.add_argument("--metric_for_best_model", type=str, default=None)
-    parser.add_argument("--greater_is_better", type=str, default=None)
-    parser.add_argument("--wandb_enabled", type=str, default=None)
-    parser.add_argument("--wandb_mode", type=str, default=None)
-    parser.add_argument("--wandb_project", type=str, default=None)
-    parser.add_argument("--wandb_entity", type=str, default=None)
-    parser.add_argument("--wandb_run_name", type=str, default=None)
-    parser.add_argument("--wandb_id", type=str, default=None)
-    parser.add_argument("--wandb_resume", type=str, default=None)
-    parser.add_argument("--wandb_log_steps", type=int, default=None)
-    parser.add_argument("--resume_from_checkpoint", type=str, default=None)
-    parser.add_argument("--device", type=str, default=None)
-    parser.add_argument("--max_len", type=float, default=0.95)
-    parser.add_argument("--dropout", type=float, default=None)
-    parser.add_argument("--use_attention", type=str, default=None)
-    parser.add_argument("--optimizer_type", type=str, default=None)
-    parser.add_argument("--early_stopping_patience", type=int, default=None)
-    parser.add_argument("--min_lr", type=float, default=None)
-    parser.add_argument("--generation_temperature", type=float, default=None)
-    parser.add_argument("--generation_top_k", type=int, default=None)
-    parser.add_argument("--generation_top_p", type=float, default=None)
-    parser.add_argument("--generation_repetition_penalty", type=float, default=None)
-    parser.add_argument("--tokenizer_cache_dir", type=str, default=None)
-
-    return parser
-
-
-def _merge_cli_flags_into_config(args, config):
-    merged = dict(config)
-
-    direct_keys = [
-        "train_file", "eval_file", "output_dir", "num_epochs",
-        "learning_rate", "batch_size", "eval_batch_size",
-        "weight_decay", "gradient_accumulation_steps",
-        "label_smoothing", "warmup_steps", "warmup_ratio",
-        "scheduler_type", "max_grad_norm", "eval_steps",
-        "save_steps", "logging_steps", "metric_for_best_model",
-        "resume_from_checkpoint", "tokenizer_cache_dir", "wandb_mode", "wandb_project", "wandb_entity", "wandb_run_name", "wandb_id", "wandb_resume", "wandb_log_steps",
-        "dropout", "optimizer_type", "early_stopping_patience", "min_lr",
-        "generation_temperature", "generation_top_k", "generation_top_p", "generation_repetition_penalty",
-    ]
-
-    for key in direct_keys:
-        value = getattr(args, key)
-        if value is not None:
-            merged[key] = value
-
-    for key in ("mixed_precision", "greater_is_better", "wandb_enabled", "wandb_resume", "use_attention"):
-        raw = getattr(args, key)
-        parsed = _read_bool_like(raw) if raw is not None else None
-        if parsed is not None:
-            merged[key] = parsed
-
-    merged.update(_parse_overrides(args.overrides))
-    return merged
-
-
-def main(argv: list[str] | None = None) -> int:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    # ------------------------------------------------------------------ #
+    # 1. Tokenizer
+    # ------------------------------------------------------------------ #
+    print("Building tokenizer ...")
+    tokenizer_fn = import_from_string(args.tokenizer_factory)
+    tokenizer = tokenizer_fn(args)
+    print(
+        f"  src vocab: {tokenizer.src.vocab_size}  "
+        f"tgt vocab: {tokenizer.tgt.vocab_size}"
     )
 
-    parser = build_parser()
-    args = parser.parse_args(argv)
+    # ------------------------------------------------------------------ #
+    # 2. DataLoaders
+    # ------------------------------------------------------------------ #
+    print("Building dataloaders ...")
+    train_loader_fn = import_from_string(args.train_dataloader_factory)
+    eval_loader_fn = import_from_string(args.eval_dataloader_factory)
 
-    from src.training.trainer import train
+    train_loader = train_loader_fn(args, tokenizer)
+    eval_loader = eval_loader_fn(args, tokenizer)
+    print(f"  train batches: {len(train_loader)}  eval batches: {len(eval_loader)}")
 
-    config_from_json = _load_json_config(args.config_json)
-    config = _merge_cli_flags_into_config(args, config_from_json)
+    # ------------------------------------------------------------------ #
+    # 3. Model
+    # ------------------------------------------------------------------ #
+    print("Building model ...")
+    model_fn = import_from_string(args.model_factory)
+    model = model_fn(args, tokenizer).to(device)
+    print(f"  Parameters: {count_parameters(model):,}")
 
-    model = _call_factory(_load_callable(args.model_factory), config)
-    train_dataloader = _call_factory(_load_callable(args.train_dataloader_factory), config)
-
-    eval_dataloader = (
-        _call_factory(_load_callable(args.eval_dataloader_factory), config)
-        if args.eval_dataloader_factory
-        else None
-    )
-
-    tokenizer = (
-        _call_factory(_load_callable(args.tokenizer_factory), config)
-        if args.tokenizer_factory
-        else None
-    )
-
-    result = train(
+    # ------------------------------------------------------------------ #
+    # 4. Train
+    # ------------------------------------------------------------------ #
+    trainer = Trainer(
         model=model,
-        train_dataloader=train_dataloader,
-        eval_dataloader=eval_dataloader,
-        config=config,
+        train_loader=train_loader,
+        eval_loader=eval_loader,
         tokenizer=tokenizer,
-        device=args.device,
+        args=args,
+        device=device,
     )
-
-    print(json.dumps(result, ensure_ascii=False, indent=2))
-    return 0
+    trainer.train()
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()

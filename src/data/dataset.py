@@ -1,92 +1,130 @@
+"""
+From-scratch dataset + dataloader style batching for IWSLT-style JSONL files.
+"""
+
+import json
 import random
+from math import ceil
+from typing import List, Tuple
+
 import torch
 
+from src.data.tokenizer import TranslationTokenizer
+
+
 class TranslationDataset:
-    def __init__(self, src_texts, trg_texts, vocab_src, vocab_trg,
-                 tokenizer_src, tokenizer_trg, max_len=128,
-                 src_ids=None, trg_ids=None):
-        self.src_texts = src_texts
-        self.trg_texts = trg_texts
-        self.vocab_trg = vocab_trg         
-        self.src_data = []
-        self.trg_data = []
+    def __init__(
+        self,
+        file_path: str,
+        tokenizer: TranslationTokenizer,
+        direction: str,            # e.g. "en2vi" or "vi2en"
+        max_src_len: int = 150,
+        max_tgt_len: int = 150,
+    ):
+        self.tokenizer = tokenizer
+        self.direction = direction
+        self.src_lang, self.tgt_lang = direction.split("2")
+        self.max_src_len = max_src_len
+        self.max_tgt_len = max_tgt_len
 
-        # Nếu đã có IDs sẵn, bỏ qua tokenization hoàn toàn
-        if src_ids is not None and trg_ids is not None:
-            print(f"Đang load {len(src_ids)} câu từ cache (không tokenize lại)...")
-            self.src_data = src_ids
-            self.trg_data = trg_ids
-            print("Hoàn tất!")
-            return
+        self.data: List[Tuple[List[int], List[int]]] = []
+        self._load(file_path)
 
-        # tokenize bình thường (dùng cho eval set)
-        print(f"Đang tiền xử lý {len(src_texts)} câu...")
-        for s_text, t_text in zip(src_texts, trg_texts):
-            s_tokens = tokenizer_src.encode(s_text)[:max_len - 2]
-            t_tokens = tokenizer_trg.encode(t_text)[:max_len - 2]
-            s_ids = [vocab_src.stoi["<sos>"]] + vocab_src.numericalize(s_tokens) + [vocab_src.stoi["<eos>"]]
-            t_ids = [vocab_trg.stoi["<sos>"]] + vocab_trg.numericalize(t_tokens) + [vocab_trg.stoi["<eos>"]]
-            self.src_data.append(torch.tensor(s_ids, dtype=torch.long))
-            self.trg_data.append(torch.tensor(t_ids, dtype=torch.long))
-        print("Tiền xử lý hoàn tất!")
+    def _load(self, file_path: str):
+        with open(file_path) as f:
+            for line in f:
+                obj = json.loads(line)
+                src_text = obj[self.src_lang]
+                tgt_text = obj[self.tgt_lang]
+
+                src_ids = self.tokenizer.src.encode(src_text, add_bos=False, add_eos=True)
+                tgt_ids = self.tokenizer.tgt.encode(tgt_text, add_bos=True, add_eos=True)
+
+                if len(src_ids) > self.max_src_len or len(tgt_ids) > self.max_tgt_len:
+                    continue
+
+                self.data.append((src_ids, tgt_ids))
+
+    def __len__(self):
+        return len(self.data)
 
     def __getitem__(self, idx):
-        # Chỉ việc lấy data đã xử lý xong, cực nhanh
-        return self.src_data[idx], self.trg_data[idx]
+        src_ids, tgt_ids = self.data[idx]
+        return (
+            torch.tensor(src_ids, dtype=torch.long),
+            torch.tensor(tgt_ids, dtype=torch.long),
+        )
 
-    def __len__(self):
-        return len(self.src_data)
 
-class CollateBatch:
-    def __init__(self, pad_idx_src, pad_idx_trg):
-        self.pad_idx_src = pad_idx_src
-        self.pad_idx_trg = pad_idx_trg
-
-    def __call__(self, batch):
-        src_batch, trg_batch = zip(*batch)
-        src_padded = self._pad_sequences(src_batch, self.pad_idx_src)
-        trg_padded = self._pad_sequences(trg_batch, self.pad_idx_trg)
-        src_mask = (src_padded == self.pad_idx_src)
-        trg_mask = (trg_padded == self.pad_idx_trg)
-
-        # Tính độ dài thực của từng câu source
-        src_lengths = torch.tensor([len(s) for s in src_batch], dtype=torch.long)
-
-        return src_padded, trg_padded, src_mask, trg_mask, src_lengths
-
-    def _pad_sequences(self, sequences, pad_idx):
-        max_len = max([len(seq) for seq in sequences])
-        # Tạo tensor chứa toàn pad_idx trước
-        padded_seqs = torch.full((len(sequences), max_len), pad_idx, dtype=torch.long)
-        # Copy dữ liệu thực vào
+def collate_fn(pad_idx: int):
+    def _right_pad_sequences(sequences: List[torch.Tensor]) -> torch.Tensor:
+        max_len = max(seq.size(0) for seq in sequences)
+        batch_size = len(sequences)
+        padded = torch.full(
+            (batch_size, max_len),
+            fill_value=pad_idx,
+            dtype=sequences[0].dtype,
+        )
         for i, seq in enumerate(sequences):
-            padded_seqs[i, :len(seq)] = seq
-        return padded_seqs
+            padded[i, : seq.size(0)] = seq
+        return padded
 
-def get_dataloader(src_texts, trg_texts, vocab_src, vocab_trg, tokenizer_src, tokenizer_trg, batch_size=32, max_len=128, shuffle=False):
-    dataset = TranslationDataset(src_texts, trg_texts, vocab_src, vocab_trg, tokenizer_src, tokenizer_trg, max_len=max_len)
-    
-    # Pass cả 2 pad_idx để an toàn
-    collate_fn = CollateBatch(pad_idx_src=vocab_src.stoi['<pad>'], pad_idx_trg=vocab_trg.stoi['<pad>'])
-    
-    return TranslationDataLoader(dataset, batch_size, collate_fn, shuffle=shuffle)
+    def _collate(batch):
+        src_batch, tgt_batch = zip(*batch)
+        src_lengths = torch.tensor([s.size(0) for s in src_batch])
+        src_padded = _right_pad_sequences(list(src_batch))
+        tgt_padded = _right_pad_sequences(list(tgt_batch))
+        return src_padded, tgt_padded, src_lengths
 
-class TranslationDataLoader:
-    def __init__(self, dataset, batch_size, collate_fn, shuffle=False):
+    return _collate
+
+
+class SimpleDataLoader:
+    def __init__(
+        self,
+        dataset: TranslationDataset,
+        batch_size: int,
+        shuffle: bool,
+        collate,
+    ):
         self.dataset = dataset
         self.batch_size = batch_size
-        self.collate_fn = collate_fn
-        self.indices = list(range(len(dataset)))
         self.shuffle = shuffle
-
-    def __iter__(self):
-        if self.shuffle:
-            random.shuffle(self.indices)
-        
-        for i in range(0, len(self.indices), self.batch_size):
-            batch_idxs = self.indices[i : i + self.batch_size]
-            batch_samples = [self.dataset[idx] for idx in batch_idxs]
-            yield self.collate_fn(batch_samples)
+        self.collate = collate
 
     def __len__(self):
-        return (len(self.dataset) + self.batch_size - 1) // self.batch_size
+        if len(self.dataset) == 0:
+            return 0
+        return ceil(len(self.dataset) / self.batch_size)
+
+    def __iter__(self):
+        indices = list(range(len(self.dataset)))
+        if self.shuffle:
+            random.shuffle(indices)
+
+        for start in range(0, len(indices), self.batch_size):
+            batch_indices = indices[start: start + self.batch_size]
+            batch = [self.dataset[idx] for idx in batch_indices]
+            yield self.collate(batch)
+
+
+def build_dataloader(
+    file_path: str,
+    tokenizer: TranslationTokenizer,
+    direction: str,
+    batch_size: int = 64,
+    shuffle: bool = True,
+    num_workers: int = 2,
+    max_src_len: int = 150,
+    max_tgt_len: int = 150,
+) -> SimpleDataLoader:
+    dataset = TranslationDataset(
+        file_path, tokenizer, direction, max_src_len, max_tgt_len
+    )
+    _ = num_workers  # kept for API compatibility
+    return SimpleDataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        collate=collate_fn(tokenizer.src.pad_idx),
+    )

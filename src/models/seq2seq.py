@@ -1,99 +1,190 @@
 """
-src/models/seq2seq.py
-
-Wrapper nối Encoder và Decoder theo đúng interface hiện có trong repo.
+Seq2Seq model wrapping Encoder + Decoder.
+Supports beam-search and greedy decoding.
 """
 
 import torch
-import torch.nn as nn
+from typing import Dict, List, Optional, Tuple
 
-from src.models.decoder import Decoder
-from src.models.encoder import Encoder
+from src.models.layers import ManualModule
+from src.models.encoder import RNNEncoder
+from src.models.decoder import RNNDecoder
+from src.utils.tensor_ops import log_softmax_stable, lengths_to_padding_mask, topk_1d_manual
 
 
-class Seq2Seq(nn.Module):
-    """
-    Kết nối Encoder -> Decoder và tạo source mask từ pad token.
-
-    Module này không tự cài lại RNN/Embedding/Decoder logic.
-    Nó chỉ điều phối hai module đã có sẵn trong `src/models`.
-    """
-
+class Seq2Seq(ManualModule):
     def __init__(
         self,
-        encoder: Encoder,
-        decoder: Decoder,
-        src_pad_idx: int | None = None,
+        src_vocab_size: int,
+        tgt_vocab_size: int,
+        embed_dim: int = 256,
+        hidden_size: int = 512,
+        num_layers: int = 3,
+        cell_type: str = "lstm",
+        attention_type: str = "luong",
+        bidirectional: bool = True,
+        dropout: float = 0.1,
+        src_pad_idx: int = 0,
+        tgt_pad_idx: int = 0,
+        sos_idx: int = 1,
+        eos_idx: int = 2,
     ):
         super().__init__()
-        self.encoder = encoder
-        self.decoder = decoder
-        self.src_pad_idx = src_pad_idx
+        self.sos_idx = sos_idx
+        self.eos_idx = eos_idx
+        self.tgt_pad_idx = tgt_pad_idx
 
-    def create_src_mask(self, src: torch.Tensor) -> torch.Tensor | None:
-        if self.src_pad_idx is None:
-            return None
-        return src.eq(self.src_pad_idx)
+        self.encoder = RNNEncoder(
+            vocab_size=src_vocab_size,
+            embed_dim=embed_dim,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            cell_type=cell_type,
+            bidirectional=bidirectional,
+            dropout=dropout,
+            pad_idx=src_pad_idx,
+        )
+        self.decoder = RNNDecoder(
+            vocab_size=tgt_vocab_size,
+            embed_dim=embed_dim,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            attention_type=attention_type,
+            cell_type=cell_type,
+            dropout=dropout,
+            pad_idx=tgt_pad_idx,
+        )
 
+    # ------------------------------------------------------------------
+    # Training forward
+    # ------------------------------------------------------------------
     def forward(
         self,
-        src: torch.Tensor,
-        tgt: torch.Tensor,
-        src_lengths: torch.Tensor | None = None,
+        src: torch.Tensor,          # (batch, src_len)
+        src_lengths: torch.Tensor,  # (batch,)
+        tgt: torch.Tensor,          # (batch, tgt_len)
         teacher_forcing_ratio: float = 1.0,
-        max_length: int | None = None,
-    ):
-        """
-        Parameters
-        ----------
-        src : LongTensor [batch, src_len]
-        tgt : LongTensor [batch, tgt_len]
-        src_lengths : optional, giữ tương thích với Encoder hiện có
-        teacher_forcing_ratio : float
-        max_length : optional, nếu None thì Decoder tự dùng mặc định của nó
-        """
-        src_mask = self.create_src_mask(src)
-        encoder_outputs, final_hidden = self.encoder(src, src_lengths=src_lengths)
+        src_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:              # (batch, tgt_len-1, tgt_vocab)
+        encoder_outputs, hidden = self.encoder(src, src_lengths)
 
-        decoder_kwargs = {
-            "tgt": tgt,
-            "final_hidden": final_hidden,
-            "encoder_outputs": encoder_outputs,
-            "src_mask": src_mask,
-            "teacher_forcing_ratio": teacher_forcing_ratio,
-        }
-        if max_length is not None:
-            decoder_kwargs["max_length"] = max_length
+        if src_mask is None:
+            src_mask = lengths_to_padding_mask(src_lengths, max_len=src.size(1))
 
-        return self.decoder(**decoder_kwargs)
+        # Adjust hidden depth to match decoder num_layers
+        hidden = self._adjust_hidden(hidden)
 
+        logits = self.decoder(
+            tgt, encoder_outputs, hidden, src_mask, teacher_forcing_ratio
+        )
+        return logits
+
+    # ------------------------------------------------------------------
+    # Beam search
+    # ------------------------------------------------------------------
     @torch.no_grad()
-    def greedy_decode(
+    def beam_search(
         self,
-        src: torch.Tensor,
-        bos_token_id: int,
-        src_lengths: torch.Tensor | None = None,
-        max_length: int = 50,
-    ):
+        src: torch.Tensor,          # (1, src_len) or (batch, src_len)
+        src_lengths: torch.Tensor,
+        num_beams: int = 5,
+        max_len: int = 150,
+        length_penalty: float = 1.0,
+    ) -> List[List[int]]:
         """
-        Decode tự hồi quy bằng chính `Decoder.forward`.
-        `tgt` chỉ cần chứa token BOS ban đầu.
+        Returns best token-id sequence for each item in the batch.
         """
-        start_tokens = torch.full(
-            (src.size(0), 1),
-            bos_token_id,
-            dtype=torch.long,
-            device=src.device,
-        )
-        logits, _ = self.forward(
-            src=src,
-            tgt=start_tokens,
-            src_lengths=src_lengths,
-            teacher_forcing_ratio=0.0,
-            max_length=max_length,
-        )
-        # Return the predicted tokens (argmax of logits)
-        return logits.argmax(dim=-1)
+        batch_size = src.size(0)
+        device = src.device
 
+        encoder_outputs, hidden = self.encoder(src, src_lengths)
+        hidden = self._adjust_hidden(hidden)
+        src_mask = lengths_to_padding_mask(src_lengths, max_len=src.size(1))
 
-__all__ = ["Seq2Seq"]
+        results = []
+        for b in range(batch_size):
+            enc_out_b = encoder_outputs[b].unsqueeze(0)       # (1, src_len, h)
+            mask_b = src_mask[b].unsqueeze(0) if src_mask is not None else None
+
+            # Init per-sample hidden
+            h_b = self._slice_hidden(hidden, b)
+
+            best = self._beam_decode_single(
+                enc_out_b, h_b, mask_b, num_beams, max_len, length_penalty, device
+            )
+            results.append(best)
+        return results
+
+    def _beam_decode_single(self, enc_out, hidden, mask, num_beams, max_len, lp, device):
+        """Beam search for a single sample."""
+        context = torch.zeros(1, self.decoder.hidden_size, device=device)
+
+        # Beams: (score, token_ids, hidden, context)
+        beams = [(0.0, [self.sos_idx], hidden, context)]
+        completed = []
+
+        for _ in range(max_len):
+            if not beams:
+                break
+            candidates = []
+            for score, tokens, h, ctx in beams:
+                if tokens[-1] == self.eos_idx:
+                    completed.append((score, tokens))
+                    continue
+                tok = torch.tensor([tokens[-1]], device=device)
+                logits, new_h, new_ctx, _ = self.decoder.forward_step(
+                    tok, h, enc_out, ctx, mask
+                )
+                log_probs = log_softmax_stable(logits[0], dim=-1)
+                topk_probs, topk_ids = topk_1d_manual(log_probs, num_beams)
+                for p, idx in zip(topk_probs, topk_ids):
+                    candidates.append((score + p, tokens + [idx], new_h, new_ctx))
+
+            # Keep top-k
+            candidates.sort(key=lambda x: x[0] / (len(x[1]) ** lp), reverse=True)
+            beams = candidates[:num_beams]
+
+        # Also add unfinished beams
+        completed += [(s, t) for s, t, *_ in beams]
+        if not completed:
+            return [self.eos_idx]
+
+        completed.sort(key=lambda x: x[0] / (len(x[1]) ** lp), reverse=True)
+        best_tokens = completed[0][1]
+        # Strip <BOS> and everything after <EOS>
+        if best_tokens[0] == self.sos_idx:
+            best_tokens = best_tokens[1:]
+        if self.eos_idx in best_tokens:
+            best_tokens = best_tokens[: best_tokens.index(self.eos_idx)]
+        return best_tokens
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def _adjust_hidden(self, hidden):
+        """Trim or repeat encoder hidden to match decoder num_layers."""
+        target = self.decoder.num_layers
+        if isinstance(hidden, tuple):  # LSTM
+            h, c = hidden
+            h = self._trim_or_expand(h, target)
+            c = self._trim_or_expand(c, target)
+            return h, c
+        return self._trim_or_expand(hidden, target)
+
+    @staticmethod
+    def _trim_or_expand(h: torch.Tensor, target: int) -> torch.Tensor:
+        actual = h.size(0)
+        if actual == target:
+            return h
+        if actual > target:
+            return h[:target]
+        # Repeat last layer
+        repeats = target - actual
+        return torch.cat([h, h[-1:].expand(repeats, -1, -1)], dim=0)
+
+    def _slice_hidden(self, hidden, b: int):
+        """Slice batch dimension b from hidden state."""
+        if isinstance(hidden, tuple):
+            h, c = hidden
+            return h[:, b:b+1, :].contiguous(), c[:, b:b+1, :].contiguous()
+        return hidden[:, b:b+1, :].contiguous()
