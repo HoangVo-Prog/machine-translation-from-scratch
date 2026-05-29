@@ -156,7 +156,6 @@ python -m src.cli.train \
   --warmup_ratio 0.1 \
   --scheduler_type linear \
   --max_grad_norm 1.0 \
-  --eval_steps 200 \
   --save_steps 200 \
   --metric_for_best_model eval/bleu \
   --wandb_enabled true \

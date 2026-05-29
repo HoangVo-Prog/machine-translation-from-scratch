@@ -11,9 +11,8 @@ from typing import Optional, Callable
 
 import torch
 from tqdm import tqdm
-import sacrebleu
 
-from src.training.metrics import corpus_rouge_scores
+from src.training.metrics import corpus_bleu_score, corpus_rouge_scores
 from src.training.loss import LabelSmoothedCrossEntropy
 from src.training.optimizers import build_optimizer, LinearWarmupDecayScheduler
 from src.utils.tensor_ops import clip_grad_norm_manual
@@ -117,10 +116,16 @@ class Trainer:
                 self._save_checkpoint(str(best_path), epoch, eval_metrics)
                 print(f"  ✓ New best model saved (metric={target_metric:.4f})")
 
+                if self.wandb_run:
+                    self.wandb_run.save(str(best_path), policy="now")
+
             # Always save latest checkpoint for resuming
             last_path = output_dir / "last_checkpoint.pt"
             self._save_checkpoint(str(last_path), epoch, eval_metrics)
 
+            if self.wandb_run:
+                self.wandb_run.save(str(last_path), policy="now")
+                
             # Early stopping
             if self.early_stopping.step(target_metric):
                 print(f"Early stopping triggered after epoch {epoch}.")
@@ -213,7 +218,7 @@ class Trainer:
             src_lengths = src_lengths.to(self.device)
 
             # Loss
-            logits = self.model(src, src_lengths, tgt, teacher_forcing_ratio=1.0)
+            logits = self.model(src, src_lengths, tgt, teacher_forcing_ratio=0.0)
             loss = self.criterion(
                 logits.reshape(-1, logits.size(-1)),
                 tgt[:, 1:].reshape(-1),
@@ -248,12 +253,12 @@ class Trainer:
                 ref = self.tokenizer.tgt.decode(tgt_ids)
                 
                 hypotheses.append(hyp)
-                references.append([ref])  # sacrebleu yêu cầu danh sách dạng [[ref1], [ref2]]
+                references.append(ref)  # sacrebleu yêu cầu danh sách dạng [[ref1], [ref2]]
                 
                 if len(display_samples) < 3:
                     display_samples.append((src_text, ref, hyp))
 
-        bleu = sacrebleu.corpus_bleu(hypotheses, references).score
+        bleu = corpus_bleu_score(hypotheses, references)
         rouge_scores = corpus_rouge_scores(hypotheses, references)
         avg_loss = total_loss / len(self.eval_loader)
 

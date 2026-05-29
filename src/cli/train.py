@@ -76,7 +76,6 @@ def parse_args():
 
     # Logging & checkpointing
     parser.add_argument("--save_steps", type=int, default=1000)
-    parser.add_argument("--eval_steps", type=int, default=1000)
     parser.add_argument("--logging_steps", type=int, default=500)
 
     # W&B
