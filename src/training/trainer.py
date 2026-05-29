@@ -224,12 +224,32 @@ class Trainer:
             best_seqs = self.model.beam_search(
                 src, src_lengths, num_beams=self.args.num_beams
             )
+            
+            eos_idx = self.tokenizer.tgt.eos_idx
+            pad_idx = self.tokenizer.tgt.pad_idx
+
             for seq, src_ids, ref_ids in zip(best_seqs, src.tolist(), tgt.tolist()):
+                pred_ids = seq
+                tgt_ids = ref_ids[1:]  # Bỏ token <bos> ở đầu câu target
+
+                # Cắt chuỗi tại token <eos> đầu tiên gặp phải để loại bỏ <pad> phía sau
+                if eos_idx in pred_ids:
+                    pred_ids = pred_ids[:pred_ids.index(eos_idx)]
+                if eos_idx in tgt_ids:
+                    tgt_ids = tgt_ids[:tgt_ids.index(eos_idx)]
+
+                # Lọc bỏ hoàn toàn các token đặc biệt như <pad>
+                pred_ids = [idx for idx in pred_ids if idx != pad_idx]
+                tgt_ids = [idx for idx in tgt_ids if idx != pad_idx]
+
+                # Bây giờ mới tiến hành decode ra String sạch
                 src_text = self.tokenizer.src.decode(src_ids)
-                hyp = self.tokenizer.tgt.decode(seq)
-                ref = self.tokenizer.tgt.decode(ref_ids)
+                hyp = self.tokenizer.tgt.decode(pred_ids)
+                ref = self.tokenizer.tgt.decode(tgt_ids)
+                
                 hypotheses.append(hyp)
-                references.append([ref])
+                references.append([ref])  # sacrebleu yêu cầu danh sách dạng [[ref1], [ref2]]
+                
                 if len(display_samples) < 3:
                     display_samples.append((src_text, ref, hyp))
 
